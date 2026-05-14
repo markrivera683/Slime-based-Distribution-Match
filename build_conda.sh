@@ -256,6 +256,7 @@ pip install \
   numba \
   omegaconf \
   pylatexenc \
+  pytest \
   pyyaml \
   qwen_vl_utils \
   "ray[default]" \
@@ -267,7 +268,7 @@ pip install -e "${SLIME_DIR}" --no-deps
 assert_torch_cu129
 
 # https://github.com/pytorch/pytorch/issues/168167
-pip install nvidia-cudnn-cu12==9.16.0.29
+pip install nvidia-cudnn-cu12==9.10.2.21
 pip install "numpy<2"
 assert_torch_cu129
 

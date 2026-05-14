@@ -403,7 +403,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
     estimator. Supported methods: "grpo", "gspo", "ppo", "reinforce_plus_plus",
-    and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
+    "g1", and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
 
@@ -445,7 +445,32 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo"]:
+    if args.advantage_estimator == "g1":
+        precomputed_advantages = rollout_data.get("g1_token_advantages")
+        if precomputed_advantages is None:
+            raise ValueError("advantage_estimator='g1' requires rollout_data['g1_token_advantages']")
+
+        advantages = []
+        for i, (advantage, total_length, response_length) in enumerate(
+            zip(precomputed_advantages, total_lengths, response_lengths, strict=True)
+        ):
+            if advantage.numel() != response_length:
+                raise ValueError(
+                    f"G1 token advantage length {advantage.numel()} != response_length {response_length} at sample {i}"
+                )
+
+            if mpu.get_context_parallel_world_size() > 1:
+                advantage = slice_log_prob_with_cp(
+                    advantage,
+                    total_length,
+                    response_length,
+                    args.qkv_format,
+                    max_seq_lens[i] if max_seq_lens is not None else None,
+                )
+            advantages.append(advantage.detach())
+        returns = [adv.clone() for adv in advantages]
+
+    elif args.advantage_estimator in ["grpo", "gspo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?

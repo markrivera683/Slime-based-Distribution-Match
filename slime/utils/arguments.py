@@ -809,6 +809,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=[
                     "grpo",
                     "gspo",
+                    "g1",
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
@@ -1220,6 +1221,103 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If set, this function will replace the default _convert_samples_to_train_data. "
                     "The function should have the signature `def convert_samples_to_train_data(args, samples) -> dict`."
                 ),
+            )
+            parser.add_argument(
+                "--alignment-rew-coef",
+                type=float,
+                default=1.0,
+                help="G1/OpenRLHF alignment reward coefficient.",
+            )
+            parser.add_argument(
+                "--diversity-rew-coef",
+                type=float,
+                default=1.0,
+                help="G1/OpenRLHF diversity reward coefficient.",
+            )
+            parser.add_argument(
+                "--use-whitening",
+                action="store_true",
+                default=False,
+                help="Apply OpenRLHF G1 whitening before reward construction.",
+            )
+            parser.add_argument(
+                "--g1-prompt-length",
+                type=int,
+                default=384,
+                help="OpenRLHF G1 prompt length used by the temporary embedding path.",
+            )
+            parser.add_argument(
+                "--g1-context-length",
+                type=int,
+                default=8,
+                help="OpenRLHF G1 context length used by the temporary embedding path.",
+            )
+            parser.add_argument(
+                "--g1-generate-length",
+                type=int,
+                default=8,
+                help="OpenRLHF G1 tokens generated per strided block.",
+            )
+            parser.add_argument(
+                "--g1-stride",
+                type=int,
+                default=8,
+                help="OpenRLHF G1 stride between ground-truth blocks.",
+            )
+            parser.add_argument(
+                "--g1-response-length",
+                type=int,
+                default=376,
+                help="Fixed response length for the first OpenRLHF G1 parity path.",
+            )
+            parser.add_argument(
+                "--g1-critic-model-path",
+                type=str,
+                default=None,
+                help="HF/OpenRLHF critic model path for the temporary G1 embedding producer.",
+            )
+            parser.add_argument(
+                "--g1-tokenizer-path",
+                type=str,
+                default=None,
+                help="Tokenizer path for the temporary G1 embedding producer. Defaults to --hf-checkpoint.",
+            )
+            parser.add_argument(
+                "--g1-openrlhf-repo",
+                type=str,
+                default="/mnt/data/ebft-distribution-new/code",
+                help="OpenRLHF repository root used by the temporary G1 embedding producer.",
+            )
+            parser.add_argument(
+                "--g1-hidden-state-method",
+                type=str,
+                default="last_only",
+                help="OpenRLHF critic hidden_state_method for G1 embeddings.",
+            )
+            parser.add_argument(
+                "--g1-embedding-device",
+                type=str,
+                default="cuda",
+                help="Device for the temporary G1 embedding producer.",
+            )
+            parser.add_argument(
+                "--g1-embedding-dtype",
+                type=str,
+                choices=["float32", "bfloat16", "float16"],
+                default="bfloat16",
+                help="Model dtype for the temporary G1 embedding producer.",
+            )
+            parser.add_argument(
+                "--g1-qa-masking",
+                action="store_true",
+                default=False,
+                help="Use OpenRLHF qa_masking semantics in the temporary G1 embedding producer.",
+            )
+            parser.add_argument(
+                "--g1-document-masking",
+                action="store_true",
+                default=False,
+                help="Use OpenRLHF document_masking semantics in the temporary G1 embedding producer.",
             )
             return parser
 

@@ -743,6 +743,18 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if self.args.advantage_estimator == "g1":
+            missing = [
+                sample.index if sample.index is not None else idx
+                for idx, sample in enumerate(samples)
+                if not sample.metadata or "g1_token_advantages" not in sample.metadata
+            ]
+            if missing:
+                raise ValueError(f"advantage_estimator='g1' requires every sample to have g1_token_advantages; missing={missing}")
+            train_data["g1_token_advantages"] = [sample.metadata["g1_token_advantages"] for sample in samples]
+        elif samples[0].metadata and "g1_token_advantages" in samples[0].metadata:
+            train_data["g1_token_advantages"] = [sample.metadata["g1_token_advantages"] for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -782,6 +794,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "g1_token_advantages",
             ]:
                 if key not in data:
                     continue
