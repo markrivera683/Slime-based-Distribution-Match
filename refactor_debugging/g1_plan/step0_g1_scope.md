@@ -239,13 +239,12 @@ OpenRLHF G1 使用 `EBFTPolicyLoss`：
 
 | G1 Need | Missing Piece |
 | --- | --- |
-| `g1_gen_embedding` | slime rollout 还没有生成 |
-| `g1_gt_embedding` | slime rollout 还没有生成 |
-| frozen critic hidden states | 还没有选定 slime 侧来源 |
-| `last_token + groom` parity | 还没有对齐 OpenRLHF 语义 |
+| `g1_gen_embedding` / `g1_gt_embedding` | 旧 rollout metadata path 可生成；当前 active Megatron/ref path 不在 rollout metadata 中保留大 embedding |
+| frozen critic hidden states | 第一版已选用 Megatron `ref` snapshot trainer-side hidden；独立 embedding/critic role 未做 |
+| `last_token + groom` parity | helper-level 已覆盖；Megatron/ref runtime golden parity 未做 |
 | EBFT actor loss | 当前 slime 仍是 PPO-style loss |
 | CE auxiliary loss | 当前未接入 G1 专用 CE 项 |
-| full runtime parity | 固定 embedding / helper-level parity 已有；真实 critic/groom/full-sequence parity 还未做 |
+| full runtime parity | 固定 embedding / helper-level parity 已有；Megatron ref hidden 与 OpenRLHF critic hidden 尚未做 golden 对拍 |
 
 ## Execution Rules
 
@@ -271,7 +270,7 @@ Step 0 可以视为通过，当以下事项都满足：
 - slime 当前已有能力和缺口已列出。
 - 后续第一执行项明确为 slime baseline 和 G1 math parity，而不是加速。
 
-当前判断：Step 0 通过，Step 1 baseline 已由用户确认通过，Step 2 math parity 已通过；下一步进入 Step 3 embedding contract 与慢 HF/OpenRLHF embedding path。
+当前判断：Step 0 通过，Step 1 baseline 已由用户确认通过，Step 2 math parity 已通过；Megatron/ref trainer-side G1 smoke 已通过，维护脚本已落在 `refactor_debugging/g1_plan/run_g1_megatron_ref_smoke.sh`，group-aligned DP split 已有单元测试。下一步是 DP>1 真实 smoke、runtime parity dump，以及 EBFT actor loss 决策。
 
 ## Open Questions
 
@@ -287,7 +286,7 @@ Step 0 可以视为通过，当以下事项都满足：
 
 推荐下一步：
 
-1. 写 Step 3 embedding contract。
-2. 实现慢 HF/OpenRLHF embedding producer 的接口与 custom_generate wrapper。
-3. 补 contract / golden / DP 测试。
-4. 跑最小 G1 小闭环。
+1. 用维护脚本复跑或扩展一个 DP>1 group-aligned smoke。
+2. 补 runtime parity dump / 对拍计划。
+3. 更新 Step 5 loss decision，决定是否补 `EBFTPolicyLoss + CE`。
+4. 在以上完成前，不进入 async / OPD / 性能 sweep。

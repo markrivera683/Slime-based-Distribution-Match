@@ -20,6 +20,12 @@ slime rollout sample
 
 这一步只解决 embedding 生产与 reward/RLOO/advantage 接线，不解决 EBFT actor loss。
 
+## Temporary path vs Megatron（与 replan L29–31 对齐）
+
+本阶段对应 `g1-exact-replan_7cd78e3e.plan.md` 中「**第一版不要改 Megatron 内部**」的 **debug / temporary training path**：在 slime **rollout 之后、group RM 之前**，用 `custom_generate` + 慢 HF/OpenRLHF critic 把 `g1_gen_embedding` / `g1_gt_embedding` 写入 metadata。这是为 **strict 小闭环与 parity** 准备的 **暂时 stash**，**不是**最终生产形态；**后续仍要换成 Megatron（或等价 fast path）** 在训练侧生成 embedding，届时应移除或旁路本慢路径。
+
+当前 replan 已进入 Megatron/fast path：慢 HF/OpenRLHF critic 因环境冲突暂停，新的第一版生产方向是 `--g1-embedding-source megatron_ref --g1-reward-location trainer`。此模式下 rollout 只准备固定长度 completion、`g1_full_sequences` 和 `g1_qa_masks`；训练侧从 frozen Megatron `ref` hidden 直接生成 embedding 和 `g1_token_advantages`，不再把大 embedding list 回填到 `Sample.metadata`。
+
 ## Fixed Geometry
 
 第一版固定使用 diff-dataset G1 几何：
@@ -139,6 +145,8 @@ Whitening is not performed in the embedding producer for the first version. Whit
 
 All geometry and model paths must be configurable. First-version defaults may match diff-dataset G1, but code must not rely on hidden constants.
 
+**`--g1-critic-model-path` is Transformers-only:** the slow producer uses OpenRLHF `Critic` → `AutoModelForCausalLM.from_pretrained`. It must **not** share a directory whose `config.json` references `sglang` (typical when the same folder was prepared for SGLang). Use a separate HF-native model root for the critic; rollout can still use a different `--hf-checkpoint` for SGLang.
+
 Required knobs:
 
 - `--g1-prompt-length`
@@ -146,6 +154,8 @@ Required knobs:
 - `--g1-generate-length`
 - `--g1-stride`
 - `--g1-response-length`
+- `--g1-embedding-source`
+- `--g1-reward-location`
 - `--g1-critic-model-path`
 - `--g1-tokenizer-path`
 - `--g1-openrlhf-repo`
@@ -169,6 +179,7 @@ Recommended fixed smoke values:
 
 The implementation must fail loudly when:
 
+- `--g1-critic-model-path` has no `config.json`, invalid JSON, or `config.json` / `auto_map` references `sglang` (cannot load under Transformers AutoModel)
 - `response_length != g1_response_length`
 - `sample.label is None`
 - `prompt + label` cannot fit in `g1_prompt_length`

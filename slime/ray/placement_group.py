@@ -147,11 +147,17 @@ def create_training_models(args, pgs, rollout_manager):
     else:
         critic_model = None
 
+    needs_megatron_g1_ref = (
+        args.advantage_estimator == "g1"
+        and getattr(args, "g1_embedding_source", "rollout") == "megatron_ref"
+        and getattr(args, "g1_reward_location", "rollout") == "trainer"
+    )
+
     start_rollout_ids = ray.get(
         actor_model.async_init(
             args,
             role="actor",
-            with_ref=args.kl_coef != 0 or args.use_kl_loss,
+            with_ref=args.kl_coef != 0 or args.use_kl_loss or needs_megatron_g1_ref,
             with_opd_teacher=args.use_opd and args.opd_type == "megatron",
         )
     )

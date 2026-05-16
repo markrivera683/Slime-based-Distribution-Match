@@ -2,7 +2,7 @@
 
 本文只讨论 **OpenRLHF diff-dataset G1**（`pointwise` + `cf_target_mode=single` + RLOO + whitening + frozen critic）以及 **slime 侧要对齐的 G1 目标形态**。同一文件里画两条链，便于对照「embedding / reward 在哪一步出现」。
 
-当前实现状态：slime 已完成 reward/RLOO/token advantage 的固定 embedding 与 helper-level parity；尚未完成真实 `prompt -> rollout -> critic hidden -> last_token + groom -> embedding` runtime parity。下一步先用慢 HF/OpenRLHF embedding path 接入 slime 小闭环，再迁移到 Megatron/fast path。
+当前实现状态：slime 已完成 reward/RLOO/token advantage 的固定 embedding 与 helper-level parity；慢 HF/OpenRLHF path 已可按契约写入 metadata，但因 Qwen3.5 `transformers` / SGLang 环境冲突被暂停为 correctness stash。当前活动路线是 **Megatron/fast embedding path**：SGLang rollout 只生成固定长度 completion，RolloutManager 准备 `g1_full_sequences` / `g1_qa_masks`，Megatron actor 在训练侧切到 frozen `ref` snapshot 捕获 hidden，再完成 groom、reward/RLOO 与 `g1_token_advantages`。完整 `prompt -> Megatron ref hidden -> groom` 的 runtime parity 仍要单独用 dump/对照推进。
 
 ---
 
@@ -71,20 +71,20 @@ flowchart TD
 
 ---
 
-## 2. Slime 目标 G1：从 prompt 到 actor 更新（设计形态）
+## 2. Slime 目标 G1：从 prompt 到 actor 更新（当前 active 形态）
 
-slime 默认 **Megatron actor + SGLang rollout**；G1 reward 当前设计为 **rollout 后 group custom RM**，**预计算 token advantage** 再进 `loss.py`。
+slime 默认 **Megatron actor + SGLang rollout**；当前 active G1 path 是 **trainer-side Megatron/ref embedding**。rollout 不再写大 embedding metadata，也不走 rollout-side `group_rm/custom_rm`；它只生成固定 376-token response，并在 train data 中带上 `g1_full_sequences` / `g1_qa_masks`。训练侧切到 frozen `ref` snapshot forward hidden，随后直接写 `g1_token_advantages`。
 
 ```mermaid
 flowchart TD
     A[数据: prompt 等] --> B[SGLang 等 rollout 生成]
     B --> C[每组 K 条 Sample: tokens response_length ...]
-    C --> D[须由你实现: 写 g1_gen_embedding g1_gt_embedding 到 metadata]
-    D --> E[group_rm + custom_rm g1_core]
-    E --> F[slime.utils.g1_core: 白化 pointwise RLOO 展开]
-    F --> G[metadata: g1_token_advantages]
-    G --> H[RolloutManager 转 train_data + DP 切分]
-    H --> I[Megatron actor: compute_advantages_and_returns g1 分支]
+    C --> D[RolloutManager: g1_full_sequences / g1_qa_masks]
+    D --> E[Megatron actor 切到 ref snapshot]
+    E --> F[forward_only 捕获 decoder hidden]
+    F --> G[hidden -> block embedding -> pointwise + RLOO]
+    G --> H[rollout_data: g1_token_advantages]
+    H --> I[compute_advantages_and_returns g1 分支]
     I --> J[policy_loss_function PPO 风格 + 该 advantage]
     J --> K[反向与优化步 → 参数更新]
 ```
@@ -96,9 +96,9 @@ flowchart TD
 
 | 环节                   | OpenRLHF G1                                                 | Slime G1（当前设计）                                                                                                                     |
 | -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| **Embedding 从哪来**    | `make_experience` 里 critic 整段 forward 后 **切窗口 + groom**。    | **须单独实现**：在 rollout 或自定义 hook 里写入 `**Sample.metadata["g1_gen_embedding"]` / `["g1_gt_embedding"]`**，形状 `[num_blocks, hidden_dim]`。 |
-| **Pointwise + RLOO** | 在 `**RemoteExperienceMaker.make_experience`**。              | 在 `**slime/rollout/rm_hub/g1_core.py**` 调 `**slime/utils/g1_core.py**`。                                                            |
-| **Token advantage**  | `ebft_experience_maker` 里 `compute_advantages_and_returns`。 | 已在 RM 侧算好 `**g1_token_advantages`**，训练侧 `**advantage_estimator=g1**` 直接消费。                                                         |
+| **Embedding 从哪来**    | `make_experience` 里 critic 整段 forward 后 **切窗口 + groom**。    | 当前 active path 用 Megatron `ref` hidden；旧 rollout metadata embedding 只保留为 slow/correctness stash。 |
+| **Pointwise + RLOO** | 在 `**RemoteExperienceMaker.make_experience`**。              | trainer-side `g1_fast.py` 调 `slime/utils/g1_core.py`；旧 rollout-side `rm_hub/g1_core.py` 仍可验证同一数学。 |
+| **Token advantage**  | `ebft_experience_maker` 里 `compute_advantages_and_returns`。 | trainer-side 直接写 `rollout_data["g1_token_advantages"]`，训练侧 `advantage_estimator=g1` 消费。 |
 | **Actor 损失**         | `**EBFTPolicyLoss`** + CE 项。                                | **Megatron `policy_loss_function`**（PPO 风格 ratio/clip 等），**未自动换成 EBFT loss**；若要对齐论文/原脚本需额外改。                                       |
 
 
@@ -117,7 +117,7 @@ flowchart LR
 
 
 
-G1 的 **多样性 reward** 也依赖 **同一 prompt 下多条 completion** 的组内比较；因此 slime 里 `**--group-rm`** 且 **组大小 = `n_samples_per_prompt`** 与 OpenRLHF 的「同 prompt 连续 K 条」语义必须一致。
+G1 的 **多样性 reward** 也依赖 **同一 prompt 下多条 completion** 的组内比较；因此 trainer-side DP split 必须保持 **组大小 = `n_samples_per_prompt`** 的 prompt group 不被拆散。旧 rollout-side RM 路径用 `--group-rm` 表达同一语义；当前 Megatron/ref path 通过 group-aligned DP split 保证这一点。
 
 ---
 

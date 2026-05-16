@@ -1271,10 +1271,65 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Fixed response length for the first OpenRLHF G1 parity path.",
             )
             parser.add_argument(
+                "--g1-embedding-source",
+                type=str,
+                choices=["rollout", "megatron_ref"],
+                default="rollout",
+                help=(
+                    "Source for G1 embeddings. 'rollout' keeps the temporary custom_generate path; "
+                    "'megatron_ref' computes embeddings from the frozen Megatron ref snapshot during training."
+                ),
+            )
+            parser.add_argument(
+                "--g1-reward-location",
+                type=str,
+                choices=["rollout", "trainer"],
+                default="rollout",
+                help=(
+                    "Where to compute G1 reward/RLOO/token advantages. 'trainer' is used with "
+                    "--g1-embedding-source megatron_ref to avoid rollout metadata embeddings."
+                ),
+            )
+            parser.add_argument(
+                "--g1-use-ebft-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use OpenRLHF-style EBFT actor loss (self-ratio, no PPO clipping, prompt CE via masked_mean) "
+                    "instead of the default PPO policy loss path. Gated: requires full-sequence ``ebft_*`` tensors "
+                    "on the Megatron batch (see ``slime/utils/g1_ebft_data_contract.py``) and ``advantage_estimator=g1``."
+                ),
+            )
+            parser.add_argument(
+                "--g1-megatron-ref-forward-mode",
+                type=str,
+                choices=["standard", "openrlhf_exact"],
+                default="standard",
+                help=(
+                    "Forward semantics for the Megatron/ref G1 embedding pass. 'standard' keeps the existing fast "
+                    "packed Megatron forward. 'openrlhf_exact' is a gated diagnostic path that applies OpenRLHF "
+                    "G1 position_ids to Megatron RoPE and dumps EBFT mask parity metadata; the dense mask is "
+                    "reported separately while TE/thd support is validated."
+                ),
+            )
+            parser.add_argument(
+                "--g1-megatron-ref-apply-dense-attention-mask",
+                action="store_true",
+                help=(
+                    "In --g1-megatron-ref-forward-mode openrlhf_exact, replace Megatron TE/thd core attention "
+                    "with a ref-only torch fallback that applies the OpenRLHF dense EBFT mask. This is a "
+                    "diagnostic exactness path and is expected to be slower than the standard Megatron forward."
+                ),
+            )
+            parser.add_argument(
                 "--g1-critic-model-path",
                 type=str,
                 default=None,
-                help="HF/OpenRLHF critic model path for the temporary G1 embedding producer.",
+                help=(
+                    "Vanilla Hugging Face weights directory for the temporary G1 embedding producer "
+                    "(must load with transformers.AutoModelForCausalLM; not SGLang-patched config.json). "
+                    "Usually differs from --hf-checkpoint if the latter was rewritten for SGLang."
+                ),
             )
             parser.add_argument(
                 "--g1-tokenizer-path",
@@ -1318,6 +1373,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Use OpenRLHF document_masking semantics in the temporary G1 embedding producer.",
+            )
+            parser.add_argument(
+                "--g1-ce-loss-coef",
+                type=float,
+                default=0.03,
+                help="Cross-entropy coefficient on prompt positions when --g1-use-ebft-loss is set (OpenRLHF ce_ctl).",
             )
             return parser
 
@@ -1592,6 +1653,26 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def assert_g1_megatron_ref_trainer_stable_microbatch_order(args) -> None:
+    """Megatron/ref G1 with trainer-side grouping requires rollout sample ordering preserved."""
+    if (
+        (
+            getattr(args, "advantage_estimator", None) == "g1"
+            or bool(getattr(args, "g1_use_ebft_loss", False))
+        )
+        and getattr(args, "g1_embedding_source", "rollout") == "megatron_ref"
+        and getattr(args, "g1_reward_location", "rollout") == "trainer"
+        and bool(getattr(args, "use_dynamic_batch_size", False))
+    ):
+        raise ValueError(
+            "advantage_estimator='g1' with g1_embedding_source='megatron_ref' and g1_reward_location='trainer' "
+            "requires rollout samples to remain in strict group order (`n_samples_per_prompt` contiguous) through "
+            "the Megatron data iterator so RLOO grouping in compute_g1_token_advantages_from_embeddings matches prompts. "
+            "`use_dynamic_batch_size` reshuffles indices into token-balanced micro-batches, which can break that invariant. "
+            "Disable `--use-dynamic-batch-size` for this combination (use fixed `--micro-batch-size`)."
+        )
+
+
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
@@ -1702,6 +1783,25 @@ def slime_validate_args(args):
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
+
+    assert_g1_megatron_ref_trainer_stable_microbatch_order(args)
+
+    if bool(getattr(args, "g1_use_ebft_loss", False)):
+        if getattr(args, "loss_type", None) != "policy_loss":
+            raise ValueError("--g1-use-ebft-loss requires --loss-type policy_loss")
+        if getattr(args, "advantage_estimator", None) != "g1":
+            raise ValueError("--g1-use-ebft-loss requires --advantage-estimator g1")
+        if getattr(args, "use_kl_loss", False):
+            raise ValueError(
+                "--use-kl-loss is not supported together with --g1-use-ebft-loss "
+                "(OpenRLHF KL semantics are intentionally not implemented in this path)"
+            )
+        if float(getattr(args, "entropy_coef", 0.0)) != 0.0:
+            raise ValueError("--g1-use-ebft-loss requires --entropy-coef 0 (entropy term is out-of-scope here)")
+        if getattr(args, "use_opsm", False):
+            raise ValueError("--g1-use-ebft-loss is incompatible with --use-opsm")
+        if getattr(args, "use_tis", False) or getattr(args, "get_mismatch_metrics", False):
+            raise ValueError("--g1-use-ebft-loss is incompatible with --use-tis / --get-mismatch-metrics")
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

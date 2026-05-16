@@ -14,7 +14,7 @@
 
 ## Current State
 
-当前分支已经完成了 G1 的中段管线草稿，并已通过固定 embedding / OpenRLHF helper 级 parity：
+当前分支已经完成了 G1 的中段管线草稿，并已通过固定 embedding / OpenRLHF helper 级 parity；同时 Megatron/ref trainer-side embedding smoke 已跑通：
 
 - `slime/utils/g1_core.py`：实现 strided block 几何、whitening、alignment/diversity reward、RLOO baseline、block reward 到 token advantage 展开。
 - `slime/rollout/rm_hub/g1_core.py`：实现 group custom RM，从 `Sample.metadata` 读取 `g1_gen_embedding` / `g1_gt_embedding`，写回 `g1_token_advantages`。
@@ -24,10 +24,14 @@
 - `slime/utils/arguments.py`：新增 `--advantage-estimator g1`、`--alignment-rew-coef`、`--diversity-rew-coef`、`--use-whitening`。
 - `tests/test_g1_core.py`：覆盖核心公式、RM metadata 写入、train_data 透传、loss 消费预计算 advantages；当前目标测试已通过。
 - `refactor_debugging/g1_plan/run_openrlhf_runtime_dump_parity.sh`：用 OpenRLHF helper 生成固定 embedding golden，再用 slime 校验 reward/RLOO/token advantage parity。
+- `slime/backends/megatron_utils/g1_fast.py`：实现 trainer-side `Megatron hidden -> G1 embedding -> reward/RLOO -> token advantages`。
+- `refactor_debugging/g1_plan/run_g1_megatron_ref_smoke.sh`：维护 Megatron/ref G1 smoke；真实 Ray/Megatron run 已通过 `TP=4, PP=2, DP=1, CP=1` 与 group-aligned `TP=2, PP=1, DP=4, CP=1`。
+- `refactor_debugging/g1_plan/g1_runtime_parity_plan.md` / `g1_runtime_parity_report.md`：记录 Megatron/ref hidden 与 OpenRLHF Critic hidden 的 runtime parity 对拍计划和首轮量化结果。
 
 关键缺口：
 
-- 还没有实现从真实 rollout / critic hidden states 生成 `g1_gen_embedding` 和 `g1_gt_embedding`。
+- DP>1 group-aligned split 已通过真实 Ray/Megatron smoke；`balance_data=true` 和任意 group-level balancing 仍未支持。
+- Megatron/ref hidden 与 OpenRLHF Critic hidden 的 runtime parity 已完成首轮量化：token/QA/shape 对齐，GT block cosine 约 0.999，gen block cosine 均值约 0.906；差距主要来自 Megatron 当前未复刻 OpenRLHF EBFT dense strided attention mask / position ids。
 - 当前 slime 训练侧仍使用 PPO-style policy loss，没有完全复刻 OpenRLHF 的 `EBFTPolicyLoss`。
 - 当前 v3 plan 的 Stage 2 写的是“接受整段近似”，如果目标是复刻 G1 核心算法，需要先做 exact parity，再决定是否保留近似版本作为加速实验。
 - OpenRLHF G1 默认启用 whitening，slime 现在需要显式传 `--use-whitening`。
@@ -168,6 +172,10 @@
 ## Step 3: Add Rollout Embedding Source
 
 目标：补齐当前最大缺口，让 slime rollout 能生成 `g1_gen_embedding` 和 `g1_gt_embedding`。
+
+**与 `g1-exact-replan` L29–31 对齐的阶段性说明：** 本步优先走的是 **temporary / debug path**——**第一版不改 Megatron 内部**；在 **rollout 之后、group RM 之前** 用慢 HF/OpenRLHF critic 写入 `Sample.metadata` 中的 embedding。这是为 parity 与小闭环验证做的 **stash**，**不是**最终方案；**后续仍要迁移到 Megatron（或等价 fast path）** 在训练栈内生成 embedding，再 deprecate 或替换当前 `custom_generate` 慢路径。
+
+状态更新：OpenRLHF in-process critic 路线因 `transformers` / SGLang 环境冲突暂停。当前后续实现切到 **Megatron/fast embedding path**：rollout 只负责固定 376-token completion，训练侧用 actor 的 `ref`/frozen snapshot forward hidden，在 trainer 内部完成 embedding -> pointwise reward/RLOO -> `g1_token_advantages`。旧慢路径保留为 correctness stash，不作为 smoke blocker。
 
 执行顺序：
 
@@ -404,6 +412,6 @@
 
 ## Immediate Next Step
 
-下一步执行 Step 3：Add Rollout Embedding Source。
+下一步决定是否推进 OpenRLHF EBFT attention/mask parity，或接受当前 Megatron/ref hidden gap 并进入 EBFT loss / 实验命名决策。
 
-不要先做 async、OPD 或 EBFT loss。先用慢 HF/OpenRLHF embedding path 把 `g1_gen_embedding` / `g1_gt_embedding` 写入 slime `Sample.metadata`，跑通 G1 小闭环，再决定 Megatron fast path 与 EBFT loss。
+不要先做 async、OPD 或性能 sweep。当前 runtime parity 已显示生成区存在可解释差距；旧 OpenRLHF/HF in-process critic 路径只作为 debug stash。当前分支 Step 5 决策是暂不实现 EBFT loss，直到确认是否追求 exact-loss branch。

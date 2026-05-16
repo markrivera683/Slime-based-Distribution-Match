@@ -7,13 +7,23 @@ import torch.nn.functional as F
 from slime.rollout.rm_hub.g1_core import compute_group_g1_rewards
 from slime.rollout.g1_embedding import (
     G1EmbeddingConfig,
+    assert_g1_critic_checkpoint_is_transformers_hf,
     build_g1_full_sequence_inputs,
     build_g1_prompt_inputs,
     hidden_states_to_g1_embeddings,
 )
 from slime.ray import rollout as rollout_module
 from slime.ray.rollout import RolloutManager
+from slime.backends.megatron_utils import data as data_module
 from slime.backends.megatron_utils import loss as loss_module
+from slime.backends.megatron_utils.g1_fast import (
+    build_megatron_rotary_pos_emb_from_position_ids,
+    build_openrlhf_g1_attention_mask_and_position_ids,
+    compute_g1_token_advantages_from_embeddings,
+    megatron_hidden_to_g1_embeddings,
+    openrlhf_dense_mask_thd_attention,
+    pack_openrlhf_g1_attention_mask,
+)
 from slime.utils.g1_core import (
     compute_pointwise_rewards,
     compute_rloo_baseline,
@@ -326,6 +336,42 @@ def test_hidden_states_to_g1_embeddings_matches_openrlhf_block_order():
     torch.testing.assert_close(gen_embedding, torch.tensor([[[11.0], [12.0], [13.0]]]))
 
 
+def test_megatron_hidden_to_g1_embeddings_matches_shared_block_helper(monkeypatch):
+    from megatron.core import mpu
+
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    args = Namespace(
+        qkv_format="thd",
+        g1_prompt_length=8,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_response_length=6,
+        g1_hidden_state_method="last_only",
+        g1_qa_masking=False,
+        g1_document_masking=False,
+        n_samples_per_prompt=1,
+    )
+    hidden_seq = torch.arange(28, dtype=torch.float32).reshape(14, 2)
+    hidden_states = hidden_seq.unsqueeze(1)
+    qa_mask = torch.ones(14, dtype=torch.long)
+
+    gen_embedding, gt_embedding = megatron_hidden_to_g1_embeddings(
+        hidden_states,
+        args=args,
+        total_lengths=[14],
+        g1_qa_masks=[qa_mask],
+    )
+    expected_gen, expected_gt = hidden_states_to_g1_embeddings(
+        F.normalize(hidden_seq, p=2, dim=-1).reshape(1, 14, 1, 2),
+        qa_mask.reshape(1, 14),
+        G1EmbeddingConfig(prompt_length=8, context_length=2, generate_length=2, stride=2, response_length=6),
+    )
+
+    torch.testing.assert_close(gen_embedding[0], expected_gen[0])
+    torch.testing.assert_close(gt_embedding[0], expected_gt[0])
+
+
 def test_rloo_baseline_matches_openrlhf_formula_for_pointwise_rewards():
     gt_rewards = torch.tensor([[[2.0, 4.0], [6.0, 8.0], [10.0, 12.0], [14.0, 16.0]]])
     diversity_rewards = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
@@ -420,6 +466,38 @@ def test_group_g1_reward_matches_fixed_embedding_reference_metadata():
         assert scalar_rewards[idx] == pytest.approx(float(expected_rewards[0, idx].mean().item()))
 
 
+def test_trainer_side_g1_advantages_match_group_rm_math():
+    gen_embedding, gt_embedding = _fixed_openrlhf_block_embeddings()
+    args = Namespace(
+        n_samples_per_prompt=4,
+        alignment_rew_coef=1.0,
+        diversity_rew_coef=1.0,
+        use_whitening=True,
+        g1_response_length=6,
+    )
+    token_advantages, scalar_rewards = compute_g1_token_advantages_from_embeddings(
+        args,
+        [gen_embedding[0, 0, idx] for idx in range(4)],
+        [gt_embedding[0, 0, idx] for idx in range(4)],
+        [6, 6, 6, 6],
+    )
+    samples = [
+        Sample(
+            response_length=6,
+            metadata={
+                "g1_gen_embedding": gen_embedding[0, 0, idx].tolist(),
+                "g1_gt_embedding": gt_embedding[0, 0, idx].tolist(),
+            },
+        )
+        for idx in range(4)
+    ]
+    expected_scalar_rewards = compute_group_g1_rewards(args, samples)
+
+    assert scalar_rewards == pytest.approx(expected_scalar_rewards)
+    for idx, sample in enumerate(samples):
+        torch.testing.assert_close(token_advantages[idx], torch.tensor(sample.metadata["g1_token_advantages"]))
+
+
 def test_group_g1_reward_populates_token_advantages_from_metadata_embeddings():
     args = Namespace(
         n_samples_per_prompt=4,
@@ -483,6 +561,47 @@ def test_default_train_data_conversion_preserves_g1_token_advantages():
 
     assert train_data["g1_token_advantages"] == [[0.1, 0.2], [-0.1, -0.2]]
     assert train_data["loss_masks"] == [[1, 1], [1, 1]]
+
+
+def test_train_data_conversion_prepares_megatron_g1_sequences_without_rollout_advantages(monkeypatch):
+    from slime.utils import processing_utils
+
+    monkeypatch.setattr(processing_utils, "load_tokenizer", lambda *args, **kwargs: _FakeTokenizer())
+    rollout_manager_class = getattr(getattr(RolloutManager, "__ray_metadata__", None), "modified_class", RolloutManager)
+    manager = object.__new__(rollout_manager_class)
+    manager.args = Namespace(
+        reward_key=None,
+        advantage_estimator="g1",
+        rewards_normalization=False,
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        g1_tokenizer_path="unused",
+        hf_checkpoint="unused",
+        g1_prompt_length=6,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_response_length=4,
+        n_samples_per_prompt=2,
+        g1_openrlhf_repo="/unused",
+        g1_hidden_state_method="last_only",
+        g1_embedding_device="cuda",
+        g1_embedding_dtype="bfloat16",
+        g1_qa_masking=False,
+        g1_document_masking=False,
+    )
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = None
+    samples = [
+        Sample(index=0, prompt="ab", label="cd", tokens=[1, 2, 5, 6, 5, 6], response_length=4, reward=0.0),
+        Sample(index=1, prompt="ab", label="cd", tokens=[1, 2, 6, 5, 6, 5], response_length=4, reward=0.0),
+    ]
+
+    train_data = rollout_manager_class._convert_samples_to_train_data(manager, samples)
+
+    assert "g1_token_advantages" not in train_data
+    assert train_data["g1_full_sequences"][0] == [1, 2, 3, 4, 0, 0, 5, 6, 5, 6]
+    assert train_data["g1_qa_masks"][0] == [0, 0, 1, 1, 0, 0, 1, 1, 1, 1]
 
 
 def test_g1_advantage_estimator_consumes_precomputed_token_advantages(monkeypatch):
@@ -616,9 +735,305 @@ def test_split_train_data_by_dp_preserves_g1_token_advantages(monkeypatch):
         "loss_masks": [[1, 1], [1, 1], [1, 1], [1, 1]],
         "sample_indices": [0, 1, 2, 3],
         "g1_token_advantages": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]],
+        "g1_full_sequences": [[1, 2], [3, 4], [5, 6], [7, 8]],
+        "g1_qa_masks": [[1, 1], [1, 1], [1, 1], [1, 1]],
     }
 
     refs = rollout_manager_class._split_train_data_by_dp(manager, data, dp_size=2)
 
     assert refs[0].inner["g1_token_advantages"] == [[0.1, 0.2], [0.5, 0.6]]
     assert refs[1].inner["g1_token_advantages"] == [[0.3, 0.4], [0.7, 0.8]]
+    assert refs[0].inner["g1_full_sequences"] == [[1, 2], [5, 6]]
+    assert refs[1].inner["g1_qa_masks"] == [[1, 1], [1, 1]]
+
+
+def test_split_train_data_by_dp_keeps_megatron_g1_prompt_groups_together(monkeypatch):
+    rollout_manager_class = getattr(getattr(RolloutManager, "__ray_metadata__", None), "modified_class", RolloutManager)
+    manager = object.__new__(rollout_manager_class)
+    manager.args = Namespace(
+        advantage_estimator="g1",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        n_samples_per_prompt=4,
+        balance_data=False,
+    )
+    monkeypatch.setattr(rollout_module.ray, "put", lambda value: value)
+
+    data = {
+        "tokens": [[idx] for idx in range(16)],
+        "response_lengths": [2] * 16,
+        "rewards": [0.0] * 16,
+        "truncated": [False] * 16,
+        "loss_masks": [[1, 1] for _ in range(16)],
+        "sample_indices": list(range(16)),
+        "g1_full_sequences": [[idx, idx] for idx in range(16)],
+        "g1_qa_masks": [[1, 1] for _ in range(16)],
+    }
+
+    refs = rollout_manager_class._split_train_data_by_dp(manager, data, dp_size=2)
+
+    assert refs[0].inner["sample_indices"] == [0, 1, 2, 3, 8, 9, 10, 11]
+    assert refs[1].inner["sample_indices"] == [4, 5, 6, 7, 12, 13, 14, 15]
+    for ref in refs:
+        group_ids = [idx // 4 for idx in ref.inner["sample_indices"]]
+        assert group_ids[0:4] == [group_ids[0]] * 4
+        assert group_ids[4:8] == [group_ids[4]] * 4
+
+
+def test_split_train_data_by_dp_rejects_megatron_g1_balance_data(monkeypatch):
+    rollout_manager_class = getattr(getattr(RolloutManager, "__ray_metadata__", None), "modified_class", RolloutManager)
+    manager = object.__new__(rollout_manager_class)
+    manager.args = Namespace(
+        advantage_estimator="g1",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        n_samples_per_prompt=4,
+        balance_data=True,
+    )
+    monkeypatch.setattr(rollout_module.ray, "put", lambda value: value)
+    data = {
+        "tokens": [[idx] for idx in range(8)],
+        "response_lengths": [2] * 8,
+        "rewards": [0.0] * 8,
+        "truncated": [False] * 8,
+        "loss_masks": [[1, 1] for _ in range(8)],
+        "g1_full_sequences": [[idx, idx] for idx in range(8)],
+        "g1_qa_masks": [[1, 1] for _ in range(8)],
+    }
+
+    with pytest.raises(ValueError, match="group-aligned DP split"):
+        rollout_manager_class._split_train_data_by_dp(manager, data, dp_size=2)
+
+
+def test_split_train_data_by_dp_rejects_megatron_g1_uneven_group_count(monkeypatch):
+    rollout_manager_class = getattr(getattr(RolloutManager, "__ray_metadata__", None), "modified_class", RolloutManager)
+    manager = object.__new__(rollout_manager_class)
+    manager.args = Namespace(
+        advantage_estimator="g1",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        n_samples_per_prompt=4,
+        balance_data=False,
+    )
+    monkeypatch.setattr(rollout_module.ray, "put", lambda value: value)
+    data = {
+        "tokens": [[idx] for idx in range(12)],
+        "response_lengths": [2] * 12,
+        "rewards": [0.0] * 12,
+        "truncated": [False] * 12,
+        "loss_masks": [[1, 1] for _ in range(12)],
+        "g1_full_sequences": [[idx, idx] for idx in range(12)],
+        "g1_qa_masks": [[1, 1] for _ in range(12)],
+    }
+
+    with pytest.raises(ValueError, match="must be divisible by dp_size"):
+        rollout_manager_class._split_train_data_by_dp(manager, data, dp_size=2)
+
+
+def test_g1_megatron_ref_trainer_rejects_dynamic_batch_size():
+    """Trainer-side Megatron G1 reshapes embeddings by contiguous prompt groups."""
+    from slime.utils.arguments import assert_g1_megatron_ref_trainer_stable_microbatch_order
+
+    incompatible = Namespace(
+        advantage_estimator="g1",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        use_dynamic_batch_size=True,
+    )
+    with pytest.raises(ValueError, match="use_dynamic_batch_size"):
+        assert_g1_megatron_ref_trainer_stable_microbatch_order(incompatible)
+
+    fixed = Namespace(
+        advantage_estimator="g1",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        use_dynamic_batch_size=False,
+    )
+    assert_g1_megatron_ref_trainer_stable_microbatch_order(fixed)
+
+
+def test_log_rollout_data_skips_g1_integer_payloads(monkeypatch):
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(data_module.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(data_module, "gather_log_data", lambda *args, **kwargs: {})
+    monkeypatch.setattr(data_module, "log_multi_turn_data", lambda *args, **kwargs: None)
+    monkeypatch.setattr(data_module, "log_passrate", lambda *args, **kwargs: None)
+
+    rollout_data = {
+        "response_lengths": [2],
+        "loss_masks": [torch.ones(2)],
+        "total_lengths": [4],
+        "rewards": [1.0],
+        "g1_full_sequences": [torch.tensor([1, 2, 3, 4], dtype=torch.long)],
+        "g1_qa_masks": [torch.tensor([0, 1, 1, 1], dtype=torch.long)],
+    }
+
+    data_module.log_rollout_data(
+        0,
+        Namespace(
+            qkv_format="thd",
+            log_multi_turn=False,
+            log_passrate=False,
+            log_correct_samples=False,
+            ci_test=False,
+        ),
+        rollout_data,
+    )
+
+
+def test_append_g1_runtime_dump_accumulates_dump_sample_count(tmp_path):
+    from slime.backends.megatron_utils.loss import _append_g1_runtime_dump
+
+    meta = {"data_parallel_rank": 0, "tensor_model_parallel_rank": 0}
+
+    def _micro_payload(tokens_len: int) -> dict:
+        t = torch.arange(tokens_len, dtype=torch.long)
+        masks = torch.ones(tokens_len, dtype=torch.long)
+        embed = torch.zeros((1, 4, 8), dtype=torch.float32)
+        return {
+            "total_lengths": [int(tokens_len)],
+            "tokens": [t.clone()],
+            "g1_qa_masks": [masks],
+            "g1_gen_embedding": [embed.clone()],
+            "g1_gt_embedding": [embed.clone()],
+            "hidden_states_post_sp_gather": torch.zeros(int(tokens_len), 8),
+            "g1_dump_writer_metadata": meta,
+        }
+
+    path = tmp_path / "dump.pt"
+    _append_g1_runtime_dump(path, _micro_payload(6))
+    first = torch.load(path, map_location="cpu", weights_only=False)
+    assert first["dump_sample_count_total"] == 1
+    assert len(first["total_lengths"]) == 1
+    assert first["g1_dump_writer_metadata"]["data_parallel_rank"] == 0
+
+    _append_g1_runtime_dump(path, _micro_payload(10))
+    merged = torch.load(path, map_location="cpu", weights_only=False)
+    assert merged["dump_sample_count_total"] == 2
+    assert merged["total_lengths"] == [6, 10]
+    assert merged["hidden_states_post_sp_gather"].shape[0] == 16
+
+
+def test_megatron_ref_smoke_script_uses_trainer_side_g1_path():
+    script = "/mnt/data/distribution-matching-slime/code/slime-0.2.4/refactor_debugging/g1_plan/run_g1_megatron_ref_smoke.sh"
+    with open(script, encoding="utf-8") as f:
+        content = f.read()
+
+    assert "slime.rollout.g1_embedding.generate_fixed_length_for_g1" in content
+    assert "--g1-embedding-source megatron_ref" in content
+    assert "--g1-reward-location trainer" in content
+    assert "--g1-critic-model-path" not in content
+    assert "GROUP_RM=false" in content
+    assert "PRINT_ONLY" in content
+    assert "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} must be divisible by DP_SIZE" in content
+    assert "CONTEXT_PARALLEL_SIZE=1" in content
+
+
+def test_openrlhf_g1_position_ids_match_expected_strided_layout():
+    args = Namespace(
+        g1_prompt_length=6,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_response_length=4,
+        n_samples_per_prompt=2,
+        g1_hidden_state_method="last_only",
+        g1_qa_masking=False,
+        g1_document_masking=False,
+    )
+
+    attention_mask, position_ids = build_openrlhf_g1_attention_mask_and_position_ids(
+        args,
+        batch_size=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(position_ids, torch.tensor([[0, 1, 2, 3, 4, 5, 2, 4, 3, 5]]))
+    assert tuple(attention_mask.shape) == (1, 1, 10, 10)
+    assert attention_mask[0, 0, 6, 0].item() == 0.0
+    assert attention_mask[0, 0, 6, 1].item() == 0.0
+    assert attention_mask[0, 0, 6, 2].item() < -1e20
+    assert attention_mask[0, 0, 8, 6].item() == 0.0
+    assert attention_mask[0, 0, 8, 7].item() < -1e20
+
+
+def test_custom_megatron_rope_uses_non_monotonic_openrlhf_positions():
+    class _Rotary:
+        rotary_interleaved = False
+        seq_len_interpolation_factor = None
+
+        def __init__(self):
+            self.inv_freq = torch.tensor([1.0, 0.5])
+
+    position_ids = torch.tensor([[0, 1, 2, 2, 4, 3]])
+    custom = build_megatron_rotary_pos_emb_from_position_ids(_Rotary(), position_ids).squeeze(1).squeeze(1)
+    default = build_megatron_rotary_pos_emb_from_position_ids(
+        _Rotary(),
+        torch.arange(position_ids.numel()).view_as(position_ids),
+    ).squeeze(1).squeeze(1)
+
+    torch.testing.assert_close(custom[2], custom[3])
+    assert not torch.equal(custom, default)
+
+
+def test_pack_openrlhf_g1_attention_mask_preserves_sample_blocks():
+    min_value = torch.finfo(torch.float32).min
+    mask = torch.full((2, 1, 3, 3), min_value)
+    mask[0, 0, 0, 0] = 0.0
+    mask[0, 0, 1, :2] = 0.0
+    mask[1, 0, 0, 0] = 0.0
+    mask[1, 0, 1, :2] = 0.0
+    mask[1, 0, 2, :3] = 0.0
+
+    packed = pack_openrlhf_g1_attention_mask(mask, total_lengths=[2, 3])
+
+    assert tuple(packed.shape) == (1, 1, 5, 5)
+    torch.testing.assert_close(packed[:, :, :2, :2], mask[:1, :, :2, :2])
+    torch.testing.assert_close(packed[:, :, 2:5, 2:5], mask[1:2, :, :3, :3])
+    assert packed[0, 0, 1, 2].item() == min_value
+    assert packed[0, 0, 4, 1].item() == min_value
+
+
+def test_openrlhf_dense_mask_thd_attention_applies_arbitrary_mask():
+    query = torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]])
+    key = torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]])
+    value = torch.tensor([[[10.0, 0.0]], [[20.0, 0.0]]])
+    min_value = torch.finfo(torch.float32).min
+    mask = torch.tensor([[[[0.0, min_value], [min_value, 0.0]]]])
+
+    output = openrlhf_dense_mask_thd_attention(query, key, value, mask, softmax_scale=1.0)
+
+    torch.testing.assert_close(output[:, 0], torch.tensor([[10.0, 0.0], [20.0, 0.0]]))
+
+
+def test_assert_g1_critic_checkpoint_rejects_sglang_auto_map(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"auto_map": {"AutoConfig": "sglang.srt.configs.qwen3_5.Qwen3_5Config"}, "model_type": "qwen3_5"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="SGLang-patched"):
+        assert_g1_critic_checkpoint_is_transformers_hf(str(tmp_path))
+
+
+def test_assert_g1_critic_checkpoint_rejects_transformers_unknown_model_type(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="SGLang config class|AutoConfig/AutoModelForCausalLM"):
+        assert_g1_critic_checkpoint_is_transformers_hf(str(tmp_path))
+
+
+def test_assert_g1_critic_checkpoint_accepts_hf_native_config(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}',
+        encoding="utf-8",
+    )
+    assert_g1_critic_checkpoint_is_transformers_hf(str(tmp_path))
+
+
+def test_assert_g1_critic_checkpoint_missing_config_json(tmp_path):
+    with pytest.raises(ValueError, match="config.json"):
+        assert_g1_critic_checkpoint_is_transformers_hf(str(tmp_path))

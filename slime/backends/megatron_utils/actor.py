@@ -4,6 +4,7 @@ import random
 import socket
 from argparse import Namespace
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import ray
@@ -31,8 +32,15 @@ from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
+from .g1_fast import compute_g1_token_advantages_from_embeddings
 from .initialize import init, is_megatron_main_rank
-from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from .loss import (
+    compute_advantages_and_returns,
+    get_g1_embeddings_from_hidden_states,
+    get_log_probs_and_entropy,
+    get_values,
+    g1_runtime_dump_writer_only,
+)
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -206,6 +214,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 torch.tensor(t, dtype=torch.float32, device=torch.cuda.current_device())
                 for t in rollout_data["g1_token_advantages"]
             ]
+        if "g1_full_sequences" in rollout_data:
+            rollout_data["g1_full_sequences"] = [
+                torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["g1_full_sequences"]
+            ]
+        if "g1_qa_masks" in rollout_data:
+            rollout_data["g1_qa_masks"] = [
+                torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["g1_qa_masks"]
+            ]
         if "multimodal_train_inputs" in rollout_data:
             # Move multimodal training tensors to GPU in advance
             rollout_data["multimodal_train_inputs"] = [
@@ -365,6 +381,76 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
+    def compute_g1_token_advantages(
+        self,
+        rollout_data: RolloutBatch,
+    ) -> None:
+        if self.args.g1_embedding_source != "megatron_ref" or self.args.g1_reward_location != "trainer":
+            return
+        required = ["g1_full_sequences", "g1_qa_masks"]
+        missing = [key for key in required if key not in rollout_data]
+        if missing:
+            raise ValueError(f"Megatron G1 fast path requires rollout_data keys {missing}")
+        if "ref" not in self.weights_backuper.backup_tags:
+            raise ValueError("Megatron G1 fast path requires a ref checkpoint/snapshot; set --ref-load")
+
+        g1_rollout_data = dict(rollout_data)
+        g1_rollout_data["tokens"] = rollout_data["g1_full_sequences"]
+        g1_rollout_data["total_lengths"] = [int(t.numel()) for t in g1_rollout_data["tokens"]]
+        g1_rollout_data["response_lengths"] = [int(self.args.g1_response_length)] * len(g1_rollout_data["tokens"])
+        g1_rollout_data["loss_masks"] = [
+            torch.ones(int(self.args.g1_response_length), dtype=torch.int, device=torch.cuda.current_device())
+            for _ in g1_rollout_data["tokens"]
+        ]
+        if self.args.qkv_format == "bshd":
+            max_seq_len = max(t.size(0) for t in g1_rollout_data["tokens"])
+            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
+            g1_rollout_data["max_seq_lens"] = [max_seq_len] * len(g1_rollout_data["tokens"])
+
+        dump_path = os.getenv("G1_RUNTIME_DUMP_PATH")
+        # Single DP rank clears the dump so later appends inside the ref forward cannot
+        # merge unrelated runs that happen to reuse the path.
+        if dump_path and g1_runtime_dump_writer_only():
+            Path(dump_path).unlink(missing_ok=True)
+
+        g1_data_iterator, g1_num_microbatches = get_data_iterator(self.args, self.model, g1_rollout_data)
+        try:
+            with timer("g1_megatron_embeddings"):
+                embeddings = forward_only(
+                    get_g1_embeddings_from_hidden_states,
+                    self.args,
+                    self.model,
+                    g1_data_iterator,
+                    g1_num_microbatches,
+                    collect_hidden_states=True,
+                    extra_batch_keys=["g1_qa_masks"],
+                )
+            # Non-last pipeline stages receive `{}` here; intermediate ranks must still
+            # drop heavyweight G1 keys so rollout_data stays pipeline-safe.
+            if not embeddings:
+                return
+            token_advantages, scalar_rewards = compute_g1_token_advantages_from_embeddings(
+                self.args,
+                embeddings["g1_gen_embedding"],
+                embeddings["g1_gt_embedding"],
+                rollout_data["response_lengths"],
+            )
+            if dump_path and g1_runtime_dump_writer_only():
+                output_path = Path(dump_path)
+                if output_path.exists():
+                    dump = torch.load(output_path, map_location="cpu", weights_only=False)
+                    dump["g1_token_advantages"] = [t.detach().cpu() for t in token_advantages]
+                    dump["scalar_rewards"] = [float(x) for x in scalar_rewards]
+                    torch.save(dump, output_path)
+            rollout_data["g1_token_advantages"] = token_advantages
+            rollout_data["rewards"] = scalar_rewards
+        finally:
+            # Strip large tensors after embedding pass unless EBFT loss plumbing needs masks/sequences.
+            if not bool(getattr(self.args, "g1_use_ebft_loss", False)):
+                rollout_data.pop("g1_full_sequences", None)
+                rollout_data.pop("g1_qa_masks", None)
+
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.debug_rollout_only:
             return
@@ -441,6 +527,12 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="teacher_",
                         )
                     )
+
+                if self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
+                    if self.args.use_routing_replay:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    self._switch_model("ref")
+                    self.compute_g1_token_advantages(rollout_data)
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:

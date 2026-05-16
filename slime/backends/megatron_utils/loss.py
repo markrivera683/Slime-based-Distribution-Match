@@ -1,4 +1,6 @@
+import os
 from argparse import Namespace
+from pathlib import Path
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -21,6 +23,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+from slime.utils.g1_ebft_loss import ebft_mean_rl_ce_over_packed_samples
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -356,6 +359,221 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def _block_diag_append_packed_mask(existing: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+    min_value = torch.finfo(new.dtype).min
+    merged = torch.full(
+        (1, 1, existing.shape[-1] + new.shape[-1], existing.shape[-1] + new.shape[-1]),
+        min_value,
+        dtype=new.dtype,
+    )
+    merged[:, :, : existing.shape[-2], : existing.shape[-1]] = existing
+    merged[:, :, existing.shape[-2] :, existing.shape[-1] :] = new
+    return merged
+
+
+def g1_runtime_dump_writer_only() -> bool:
+    """True on the unique rank allowed to mutate ``G1_RUNTIME_DUMP_PATH``.
+
+    Writes are restricted to the last pipeline stage, tensor-model-parallel rank
+    zero, and (non-context-parallel) data-parallel rank zero so DP replicas do not
+    race on a shared path or append incompatible shards.
+    """
+    if not os.getenv("G1_RUNTIME_DUMP_PATH"):
+        return False
+    return bool(
+        mpu.is_pipeline_last_stage()
+        and mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.get_data_parallel_rank(with_context_parallel=False) == 0
+    )
+
+
+def collect_g1_runtime_dump_writer_metadata() -> dict[str, Any]:
+    """Rank/placement snapshot stored into G1 runtime dumps for reproducibility."""
+
+    def _maybe_vpp_world_size():
+        getter = getattr(mpu, "get_virtual_pipeline_model_parallel_world_size", None)
+        if getter is None:
+            return None
+        try:
+            ws = getter()
+        except Exception:  # pragma: no cover - mirrors data.py tolerant style
+            return None
+        return int(ws) if ws is not None else None
+
+    return {
+        "data_parallel_rank": int(mpu.get_data_parallel_rank(with_context_parallel=False)),
+        "data_parallel_world_size": int(mpu.get_data_parallel_world_size(with_context_parallel=False)),
+        "tensor_model_parallel_rank": int(mpu.get_tensor_model_parallel_rank()),
+        "tensor_model_parallel_world_size": int(mpu.get_tensor_model_parallel_world_size()),
+        "context_parallel_rank": int(mpu.get_context_parallel_rank()),
+        "context_parallel_world_size": int(mpu.get_context_parallel_world_size()),
+        "pipeline_model_parallel_rank": int(mpu.get_pipeline_model_parallel_rank()),
+        "pipeline_model_parallel_world_size": int(mpu.get_pipeline_model_parallel_world_size()),
+        "is_pipeline_last_stage": bool(mpu.is_pipeline_last_stage()),
+        "virtual_pipeline_model_parallel_world_size": _maybe_vpp_world_size(),
+    }
+
+
+def _append_g1_runtime_dump(output_path: Path, payload: dict[str, Any]) -> None:
+    chunk_samples = len(payload["total_lengths"])
+    meta = payload.get("g1_dump_writer_metadata")
+
+    if not output_path.exists():
+        if meta is None:
+            payload["g1_dump_writer_metadata"] = collect_g1_runtime_dump_writer_metadata()
+        payload.setdefault("dump_sample_count_total", chunk_samples)
+        torch.save(payload, output_path)
+        return
+
+    existing = torch.load(output_path, map_location="cpu", weights_only=False)
+    prior_total = int(existing.get("dump_sample_count_total", len(existing.get("total_lengths", []))))
+
+    list_keys = ["total_lengths", "tokens", "g1_qa_masks", "g1_gen_embedding", "g1_gt_embedding"]
+    for key in list_keys:
+        payload[key] = existing.get(key, []) + payload[key]
+
+    if existing.get("hidden_states_post_sp_gather") is not None:
+        payload["hidden_states_post_sp_gather"] = torch.cat(
+            [existing["hidden_states_post_sp_gather"], payload["hidden_states_post_sp_gather"]],
+            dim=0,
+        )
+
+    for key in ["g1_position_ids", "g1_attention_mask"]:
+        if existing.get(key) is not None and payload.get(key) is not None:
+            payload[key] = torch.cat([existing[key], payload[key]], dim=0)
+
+    if existing.get("g1_packed_position_ids") is not None and payload.get("g1_packed_position_ids") is not None:
+        payload["g1_packed_position_ids"] = torch.cat(
+            [existing["g1_packed_position_ids"], payload["g1_packed_position_ids"]],
+            dim=-1,
+        )
+
+    if existing.get("g1_packed_attention_mask") is not None and payload.get("g1_packed_attention_mask") is not None:
+        payload["g1_packed_attention_mask"] = _block_diag_append_packed_mask(
+            existing["g1_packed_attention_mask"],
+            payload["g1_packed_attention_mask"],
+        )
+        payload["g1_packed_attention_mask_shape"] = tuple(payload["g1_packed_attention_mask"].shape)
+
+    payload["dump_sample_count_total"] = prior_total + chunk_samples
+    payload["g1_dump_writer_metadata"] = meta if meta is not None else existing.get("g1_dump_writer_metadata")
+    if payload["g1_dump_writer_metadata"] is None:
+        payload["g1_dump_writer_metadata"] = collect_g1_runtime_dump_writer_metadata()
+
+    torch.save(payload, output_path)
+
+
+def get_g1_embeddings_from_hidden_states(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    with_entropy: bool = False,
+    non_loss_data: bool = True,
+    max_seq_lens: list[int] | None = None,
+    hidden_states: torch.Tensor | None = None,
+    g1_qa_masks: list[torch.Tensor] | None = None,
+    g1_position_ids: torch.Tensor | None = None,
+    g1_packed_position_ids: torch.Tensor | None = None,
+    g1_attention_mask: torch.Tensor | None = None,
+    g1_packed_attention_mask: torch.Tensor | None = None,
+    g1_attention_mask_applied: bool | None = None,
+) -> dict[str, list[torch.Tensor]]:
+    """Collect G1 block embeddings from Megatron decoder hidden states.
+
+    This mirrors the `get_log_probs_and_entropy` collector shape: the pipeline
+    engine passes logits as the first positional tensor, while `forward_only`
+    supplies captured decoder hidden states as a keyword argument.
+    """
+    del logits, response_lengths, with_entropy, non_loss_data, max_seq_lens
+    if hidden_states is None:
+        raise ValueError("G1 Megatron embedding collection requires captured hidden_states")
+    if g1_qa_masks is None:
+        raise ValueError("G1 Megatron embedding collection requires g1_qa_masks in rollout_data")
+
+    if getattr(args, "sequence_parallel", False) and mpu.get_tensor_model_parallel_world_size() > 1:
+        from megatron.core import tensor_parallel
+
+        hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+            hidden_states,
+            tensor_parallel_output_grad=False,
+        )
+
+    from .g1_fast import megatron_hidden_to_g1_embeddings
+
+    gen_embeddings, gt_embeddings = megatron_hidden_to_g1_embeddings(
+        hidden_states,
+        args=args,
+        total_lengths=total_lengths,
+        g1_qa_masks=g1_qa_masks,
+    )
+
+    dump_path = os.getenv("G1_RUNTIME_DUMP_PATH")
+    if dump_path and g1_runtime_dump_writer_only():
+        output_path = Path(dump_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        hidden_for_dump = hidden_states.detach().cpu()
+        if str(getattr(args, "qkv_format", "thd")) == "thd":
+            # THD batches may be padded to a larger packed length. Keep the
+            # dumped hidden stream compact so parity reports can split it by
+            # total_lengths without accidentally comparing padding tokens.
+            hidden_for_dump = hidden_for_dump[: sum(int(x) for x in total_lengths)]
+        writer_meta = collect_g1_runtime_dump_writer_metadata()
+        chunk_samples = len(total_lengths)
+        _append_g1_runtime_dump(
+            output_path,
+            {
+                "source": "slime_megatron_ref",
+                "dump_chunk_sample_count": chunk_samples,
+                "dump_sample_count_total": chunk_samples,
+                "g1_dump_writer_metadata": writer_meta,
+                "total_lengths": [int(x) for x in total_lengths],
+                "tokens": [t.detach().cpu() for t in unconcat_tokens],
+                "g1_qa_masks": [t.detach().cpu() for t in g1_qa_masks],
+                "hidden_states_post_sp_gather": hidden_for_dump,
+                "g1_gen_embedding": [t.detach().cpu() for t in gen_embeddings],
+                "g1_gt_embedding": [t.detach().cpu() for t in gt_embeddings],
+                "g1_megatron_ref_forward_mode": str(getattr(args, "g1_megatron_ref_forward_mode", "standard")),
+                "g1_position_ids": g1_position_ids.detach().cpu() if g1_position_ids is not None else None,
+                "g1_packed_position_ids": (
+                    g1_packed_position_ids.detach().cpu() if g1_packed_position_ids is not None else None
+                ),
+                "g1_attention_mask_shape": tuple(g1_attention_mask.shape) if g1_attention_mask is not None else None,
+                "g1_attention_mask": g1_attention_mask.detach().cpu() if g1_attention_mask is not None else None,
+                "g1_packed_attention_mask_shape": (
+                    tuple(g1_packed_attention_mask.shape) if g1_packed_attention_mask is not None else None
+                ),
+                "g1_packed_attention_mask": (
+                    g1_packed_attention_mask.detach().cpu() if g1_packed_attention_mask is not None else None
+                ),
+                "g1_attention_mask_applied": bool(g1_attention_mask_applied)
+                if g1_attention_mask_applied is not None
+                else False,
+                "g1_attention_mask_status": (
+                    "openrlhf_dense_mask_applied_via_torch_thd_fallback"
+                    if g1_attention_mask is not None and bool(g1_attention_mask_applied)
+                    else "openrlhf_dense_mask_built_not_applied_to_megatron_te_thd"
+                    if g1_attention_mask is not None
+                    else "standard_megatron_attention"
+                ),
+                "g1_prompt_length": int(getattr(args, "g1_prompt_length", 384)),
+                "g1_context_length": int(getattr(args, "g1_context_length", 8)),
+                "g1_generate_length": int(getattr(args, "g1_generate_length", 8)),
+                "g1_stride": int(getattr(args, "g1_stride", 8)),
+                "g1_response_length": int(getattr(args, "g1_response_length", 376)),
+                "n_samples_per_prompt": int(getattr(args, "n_samples_per_prompt", 4)),
+                "qkv_format": str(getattr(args, "qkv_format", "thd")),
+            },
+        )
+
+    return torch.empty((0,), device=hidden_states.device), {
+        "g1_gen_embedding": gen_embeddings,
+        "g1_gt_embedding": gt_embeddings,
+    }
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
@@ -635,6 +853,157 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _assert_g1_ebft_environment(args: Namespace) -> None:
+    errs: list[str] = []
+    if args.qkv_format != "thd":
+        errs.append("qkv_format must be thd for Megatron EBFT parity loss")
+    if mpu.get_context_parallel_world_size() != 1:
+        errs.append("context_parallel_world_size must be 1 (--g1-use-ebft-loss)")
+    if bool(getattr(args, "allgather_cp", False)):
+        errs.append("allgather_cp is incompatible with --g1-use-ebft-loss until full-sequence log-prob plumbing lands")
+    if args.advantage_estimator != "g1":
+        errs.append("advantage_estimator must be g1")
+    if args.loss_type != "policy_loss":
+        errs.append("loss_type must be policy_loss")
+    if args.use_opsm:
+        errs.append("--use-kl-loss is unsupported for gated EBFT (OpenRLHF KL semantics not wired here)")
+    if float(getattr(args, "entropy_coef", 0.0)) != 0.0:
+        errs.append("entropy_coef must be 0 when using --g1-use-ebft-loss (entropy term out-of-scope)")
+    if errs:
+        raise ValueError(
+            "; ".join(errs)
+            + ". See slime/utils/g1_ebft_data_contract.py attach_ebft_g1_next_token_contract_to_batch "
+            + "for required ``ebft_*`` batch tensors."
+        )
+
+
+def thd_packed_full_sequence_next_log_probs_from_logits(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+) -> list[torch.Tensor]:
+    """Dense next-token log-probs aligned to ``experience`` ``[L-1]`` layout (THD packing, CP=1)."""
+
+    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    if args.qkv_format != "thd":
+        raise ValueError("thd_packed_full_sequence_next_log_probs_from_logits expects qkv_format thd")
+
+    lf = logits.squeeze(0)
+
+    # Keep consistent with slime response log-prob path (see ``get_responses``).
+    if args.rollout_temperature != 1.0:
+        lf = lf.div(args.rollout_temperature)
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    outs: list[torch.Tensor] = []
+    seq_cursor = 0
+
+    for tokens, total_len in zip(unconcat_tokens, total_lengths, strict=True):
+        total_len_int = int(total_len)
+        toks = tokens.reshape(-1)[:total_len_int]
+        if int(toks.numel()) != total_len_int:
+            raise ValueError("token/tensor length mismatch in EBFT dense logprob gather")
+
+        if total_len_int < 2:
+            raise ValueError("--g1-use-ebft-loss requires sequences with length >= 2")
+
+        logits_chunk = lf[seq_cursor : seq_cursor + total_len_int - 1]
+        tokens_targets = toks[1:total_len_int]
+
+        lp, _ = calculate_log_probs_and_entropy(
+            logits_chunk,
+            tokens_targets,
+            tp_group,
+            with_entropy=False,
+            chunk_size=args.log_probs_chunk_size,
+        )
+        outs.append(lp.reshape(-1))
+        seq_cursor += total_len_int
+
+    if seq_cursor > int(lf.shape[0]):
+        raise ValueError("EBFT logprob gather overran packed logits stream")
+
+    return outs
+
+
+def policy_loss_function_g1_ebft(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """OpenRLHF ``EBFTPolicyLoss``-style actor loss (RL + prompt CE), gated by ``--g1-use-ebft-loss``."""
+
+    del sum_of_sample_mean
+
+    _assert_g1_ebft_environment(args)
+
+    required_lists = ["ebft_action_mask_next", "ebft_qa_mask_next", "ebft_advantages_next"]
+    missing = [k for k in required_lists if k not in batch]
+    if missing:
+        raise ValueError(
+            f"--g1-use-ebft-loss requires `{missing}` populated on the Megatron batch. "
+            "`get_batch(..., attach_ebft_g1_next_token_contract_to_batch)` should run "
+            "after advantages + token lists are ready; rollout must include `g1_qa_masks` "
+            "when `--g1-qa-masking` is enabled."
+        )
+
+    qa_masking = bool(getattr(args, "g1_qa_masking", False))
+
+    lp_per_sample = thd_packed_full_sequence_next_log_probs_from_logits(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+    )
+
+    if len(lp_per_sample) != len(batch["ebft_action_mask_next"]):
+        raise ValueError("Per-sample EBFT log-prob gather count mismatched ebft tensors")
+
+    for lp, eb_a, eb_q, eb_adv in zip(
+        lp_per_sample,
+        batch["ebft_action_mask_next"],
+        batch["ebft_qa_mask_next"],
+        batch["ebft_advantages_next"],
+        strict=True,
+    ):
+        tgt = eb_a.numel()
+        if lp.numel() != tgt or eb_q.numel() != tgt or eb_adv.numel() != tgt:
+            raise ValueError(
+                f"Misaligned EBFT tensors: lp={tuple(lp.shape)} ebft_action_mask={tuple(eb_a.shape)} "
+                f"ebft_qa={tuple(eb_q.shape)} ebft_adv={tuple(eb_adv.shape)}."
+            )
+
+    ref_lp = lp_per_sample[0]
+    dtype = ref_lp.dtype
+    device = ref_lp.device
+
+    rl_mean, ce_mean = ebft_mean_rl_ce_over_packed_samples(
+        per_sample_log_probs_next=lp_per_sample,
+        per_sample_adv_next=[adv.to(dtype=dtype, device=device) for adv in batch["ebft_advantages_next"]],
+        per_sample_action_mask_next=[am.to(dtype=torch.bool, device=device) for am in batch["ebft_action_mask_next"]],
+        per_sample_qa_mask_next=[qm.to(dtype=torch.bool, device=device) for qm in batch["ebft_qa_mask_next"]],
+        qa_masking=qa_masking,
+        policy_loss_type="ppo",
+    )
+
+    ce_coef = float(getattr(args, "g1_ce_loss_coef", 0.03))
+    loss = rl_mean + ce_coef * ce_mean
+
+    zeros = logits.new_zeros(())
+    metrics = {
+        "loss": loss.clone().detach(),
+        "pg_loss": rl_mean.clone().detach(),
+        "entropy_loss": zeros.clone().detach(),
+        "pg_clipfrac": zeros.clone().detach(),
+        "ppo_kl": zeros.clone().detach(),
+        "g1_ebft_ce_loss": ce_mean.clone().detach(),
+    }
+    return loss, metrics
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -665,6 +1034,9 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
+    if getattr(args, "g1_use_ebft_loss", False):
+        return policy_loss_function_g1_ebft(args, batch, logits, sum_of_sample_mean)
+
     advantages = torch.cat(batch["advantages"], dim=0)
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 

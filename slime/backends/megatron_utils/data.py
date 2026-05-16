@@ -12,6 +12,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
+from slime.utils.g1_ebft_data_contract import attach_ebft_g1_next_token_contract_to_batch
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
@@ -28,6 +29,7 @@ def get_batch(
     pad_multiplier: int = 128,
     qkv_format: str = "thd",
     allgather_cp: bool = False,
+    args: Namespace | None = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -42,6 +44,8 @@ def get_batch(
         data_iterator: Iterator providing micro-batch data.
         keys: List of keys to fetch from the iterator.
         pad_multiplier: Multiplier for padding size calculation (default: 128).
+        args: Optional Slime args; when set and ``--g1-use-ebft-loss``, may attach ``ebft_*`` lists
+            (see ``slime.utils.g1_ebft_data_contract``) if ``advantages``/``g1_*`` keys are present.
 
     Returns a dict including:
     - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
@@ -172,6 +176,9 @@ def get_batch(
                     else:
                         multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
         batch["multimodal_train_inputs"] = multimodal_data
+
+    if args is not None:
+        attach_ebft_g1_next_token_contract_to_batch(batch, args)
 
     return batch
 
@@ -416,6 +423,8 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "g1_full_sequences",
+                "g1_qa_masks",
             ]:
                 continue
             # Upload per sample mean for each rollout value

@@ -743,7 +743,29 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
-        if self.args.advantage_estimator == "g1":
+        if (
+            self.args.advantage_estimator == "g1"
+            and getattr(self.args, "g1_embedding_source", "rollout") == "megatron_ref"
+            and getattr(self.args, "g1_reward_location", "rollout") == "trainer"
+        ):
+            from slime.rollout.g1_embedding import build_g1_full_sequence_inputs, g1_embedding_config_from_args
+            from slime.utils.processing_utils import load_tokenizer
+
+            config = g1_embedding_config_from_args(self.args)
+            tokenizer = load_tokenizer(config.tokenizer_path, trust_remote_code=True)
+            full_sequences = []
+            qa_masks = []
+            for sample in samples:
+                full_sequence, _, qa_mask = build_g1_full_sequence_inputs(
+                    tokenizer=tokenizer,
+                    sample=sample,
+                    config=config,
+                )
+                full_sequences.append(full_sequence.tolist())
+                qa_masks.append(qa_mask.tolist())
+            train_data["g1_full_sequences"] = full_sequences
+            train_data["g1_qa_masks"] = qa_masks
+        elif self.args.advantage_estimator == "g1":
             missing = [
                 sample.index if sample.index is not None else idx
                 for idx, sample in enumerate(samples)
@@ -770,7 +792,35 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
-        if self.args.balance_data:
+        use_g1_trainer_partition = (
+            getattr(self.args, "advantage_estimator", None) == "g1"
+            and getattr(self.args, "g1_embedding_source", "rollout") == "megatron_ref"
+            and getattr(self.args, "g1_reward_location", "rollout") == "trainer"
+        )
+        if use_g1_trainer_partition:
+            if self.args.balance_data:
+                raise ValueError("G1 trainer-side reward requires group-aligned DP split; disable --balance-data")
+            n_samples_per_prompt = int(getattr(self.args, "n_samples_per_prompt", 1))
+            if n_samples_per_prompt <= 0:
+                raise ValueError(f"n_samples_per_prompt must be positive, got {n_samples_per_prompt}")
+            if len(total_lengths) % n_samples_per_prompt != 0:
+                raise ValueError(
+                    f"G1 sample count {len(total_lengths)} must be divisible by n_samples_per_prompt={n_samples_per_prompt}"
+                )
+            num_groups = len(total_lengths) // n_samples_per_prompt
+            if num_groups % dp_size != 0:
+                raise ValueError(
+                    f"G1 rollout_batch_size/group count {num_groups} must be divisible by dp_size={dp_size} "
+                    "for the first group-aligned DP split"
+                )
+            partitions = []
+            for rank in range(dp_size):
+                partition = []
+                for group_idx in range(rank, num_groups, dp_size):
+                    start = group_idx * n_samples_per_prompt
+                    partition.extend(range(start, start + n_samples_per_prompt))
+                partitions.append(partition)
+        elif self.args.balance_data:
             partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
         else:
             partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
@@ -795,6 +845,8 @@ class RolloutManager:
                 "prompt",
                 "teacher_log_probs",
                 "g1_token_advantages",
+                "g1_full_sequences",
+                "g1_qa_masks",
             ]:
                 if key not in data:
                     continue

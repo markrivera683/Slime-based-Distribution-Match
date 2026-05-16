@@ -1,6 +1,16 @@
+"""Temporary G1 embedding path: after SGLang rollout, before group RM, write gen/gt
+embeddings into ``Sample.metadata`` via a slow Hugging Face / OpenRLHF critic.
+
+Aligned with g1-exact-replan (~L29–31): the first version does **not** change Megatron
+internals; this module is a debug stash for strict closed-loop parity. A later phase
+should replace it with a Megatron (or other fast) embedding producer inside the
+training stack.
+"""
 from __future__ import annotations
 
+import json
 import sys
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,19 +227,97 @@ def hidden_states_to_g1_embeddings(
     )
 
 
+def _load_python_module(module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module {module_name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _config_json_references_sglang(obj: object) -> bool:
+    """True when config.json would steer Transformers toward SGLang config classes."""
+    if isinstance(obj, dict):
+        auto_map = obj.get("auto_map")
+        if isinstance(auto_map, dict):
+            for value in auto_map.values():
+                if isinstance(value, str) and "sglang" in value.lower():
+                    return True
+        return any(_config_json_references_sglang(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_config_json_references_sglang(x) for x in obj)
+    return False
+
+
+def assert_g1_critic_checkpoint_is_transformers_hf(model_path: str) -> None:
+    """Fail fast if the critic directory cannot be loaded by Transformers AutoModelForCausalLM.
+
+    SGLang-served or SGLang-patched checkpoints often ship a ``config.json`` whose ``auto_map``
+    points at ``sglang.*`` modules; OpenRLHF's ``Critic`` uses ``from_pretrained`` and will
+    raise an obscure ``ValueError`` unless this is caught early.
+    """
+    root = Path(model_path).expanduser().resolve()
+    cfg_path = root / "config.json"
+    if not cfg_path.is_file():
+        raise ValueError(
+            f"--g1-critic-model-path must be a directory containing config.json; missing {cfg_path}"
+        )
+    try:
+        data: object = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {cfg_path}: {exc}") from exc
+    if _config_json_references_sglang(data):
+        raise ValueError(
+            "G1 slow embedding: --g1-critic-model-path points to an SGLang-patched checkpoint "
+            "(config.json references sglang). OpenRLHF Critic loads via "
+            "transformers.AutoModelForCausalLM, which does not accept that config class. "
+            "Use a vanilla Hugging Face model directory for the critic only (e.g. original Hub "
+            "snapshot), not the same tree as SGLang server weights unless its config.json is HF-native."
+        )
+    try:
+        from transformers import AutoConfig
+
+        auto_config = AutoConfig.from_pretrained(str(root), trust_remote_code=True)
+    except Exception as exc:
+        model_type = data.get("model_type") if isinstance(data, dict) else None
+        raise ValueError(
+            "G1 slow embedding: --g1-critic-model-path must be loadable by Transformers "
+            "AutoConfig/AutoModelForCausalLM because OpenRLHF Critic calls from_pretrained. "
+            f"Failed to load config from {root} (model_type={model_type!r}). "
+            "Use a vanilla Hugging Face checkpoint supported by the current Transformers "
+            "environment, or update the environment/model implementation before using this path."
+        ) from exc
+    if "sglang" in type(auto_config).__module__.lower():
+        raise ValueError(
+            "G1 slow embedding: --g1-critic-model-path resolved to an SGLang config class "
+            f"({type(auto_config).__module__}.{type(auto_config).__name__}). OpenRLHF Critic "
+            "requires a Transformers/HF-native model class for this temporary path."
+        )
+
+
 class SlowOpenRLHFG1EmbeddingProducer:
     def __init__(self, config: G1EmbeddingConfig) -> None:
         if config.critic_model_path is None:
             raise ValueError("--g1-critic-model-path is required for the slow G1 embedding producer")
+        assert_g1_critic_checkpoint_is_transformers_hf(config.critic_model_path)
         self.config = config
         repo = Path(config.openrlhf_repo)
         if repo.exists() and str(repo) not in sys.path:
             sys.path.insert(0, str(repo))
 
-        from openrlhf.models.critic import Critic  # type: ignore
-        from openrlhf.models.utils import build_strided_attention_mask_and_positions  # type: ignore
+        critic_module = _load_python_module(
+            "slime_g1_openrlhf_critic",
+            repo / "openrlhf" / "models" / "critic.py",
+        )
+        model_utils_module = _load_python_module(
+            "slime_g1_openrlhf_model_utils",
+            repo / "openrlhf" / "models" / "utils.py",
+        )
 
-        self._build_mask = build_strided_attention_mask_and_positions
+        Critic = critic_module.Critic
+        self._build_mask = model_utils_module.build_strided_attention_mask_and_positions
         self.device = torch.device(config.embedding_device)
         bf16 = config.embedding_dtype == "bfloat16"
         self.critic = Critic(
@@ -312,5 +400,31 @@ def attach_g1_embeddings(args: Any, sample: Sample) -> Sample:
 async def generate_with_g1_embeddings(args: Any, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False) -> Sample:
     if evaluation:
         raise ValueError("G1 group RM is not supported during eval rollout")
+    config = g1_embedding_config_from_args(args)
+    sampling_params = dict(sampling_params)
+    sampling_params["max_new_tokens"] = config.response_length
+    sampling_params["min_new_tokens"] = config.response_length
+    sampling_params["stop"] = []
+    sampling_params["stop_token_ids"] = []
+    sampling_params["ignore_eos"] = True
     sample = await sglang_generate(args, sample, sampling_params)
     return attach_g1_embeddings(args, sample)
+
+
+async def generate_fixed_length_for_g1(
+    args: Any,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+) -> Sample:
+    """Generate strict fixed-length G1 responses without rollout-side embeddings."""
+    if evaluation:
+        raise ValueError("G1 fixed-length generation is not supported during eval rollout")
+    config = g1_embedding_config_from_args(args)
+    sampling_params = dict(sampling_params)
+    sampling_params["max_new_tokens"] = config.response_length
+    sampling_params["min_new_tokens"] = config.response_length
+    sampling_params["stop"] = []
+    sampling_params["stop_token_ids"] = []
+    sampling_params["ignore_eos"] = True
+    return await sglang_generate(args, sample, sampling_params)

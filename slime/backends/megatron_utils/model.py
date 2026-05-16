@@ -3,6 +3,7 @@ import gc
 import logging
 import math
 import os
+import types
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -31,6 +32,114 @@ from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap_model_for_hooks(model: GPTModel | DDP) -> GPTModel:
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
+def _build_g1_openrlhf_exact_inputs(
+    args: Namespace,
+    *,
+    unconcat_tokens: list[torch.Tensor],
+    tokens: torch.Tensor,
+) -> dict[str, torch.Tensor | bool]:
+    """Build OpenRLHF G1 position/mask tensors for the packed Megatron ref pass."""
+    if args.qkv_format != "thd":
+        raise ValueError("G1 openrlhf_exact ref forward currently supports only qkv_format='thd'")
+    if getattr(args, "allgather_cp", False):
+        raise ValueError("G1 openrlhf_exact ref forward does not support allgather_cp yet")
+    if mpu.get_context_parallel_world_size() != 1:
+        raise ValueError("G1 openrlhf_exact ref forward currently requires context_parallel_world_size == 1")
+
+    from .g1_fast import build_openrlhf_g1_attention_mask_and_position_ids
+    from .g1_fast import pack_openrlhf_g1_attention_mask
+
+    attention_mask, position_ids = build_openrlhf_g1_attention_mask_and_position_ids(
+        args,
+        batch_size=len(unconcat_tokens),
+        device=tokens.device,
+        dtype=torch.float32,
+    )
+    total_lengths = [int(token_ids.numel()) for token_ids in unconcat_tokens]
+    packed_attention_mask = pack_openrlhf_g1_attention_mask(
+        attention_mask,
+        total_lengths=total_lengths,
+        padded_total_length=int(tokens.shape[-1]),
+    )
+    packed_position_ids = []
+    for sample_idx, token_ids in enumerate(unconcat_tokens):
+        total_length = int(token_ids.numel())
+        if total_length > position_ids.shape[1]:
+            raise ValueError(
+                f"G1 openrlhf_exact sample {sample_idx} length {total_length} exceeds "
+                f"position id length {position_ids.shape[1]}"
+            )
+        packed_position_ids.append(position_ids[sample_idx, :total_length])
+    packed_position_ids = torch.cat(packed_position_ids, dim=0)
+    pad = int(tokens.shape[-1] - packed_position_ids.numel())
+    if pad < 0:
+        raise ValueError(
+            f"G1 openrlhf_exact packed position length {packed_position_ids.numel()} exceeds token length {tokens.shape[-1]}"
+        )
+    if pad:
+        packed_position_ids = torch.nn.functional.pad(packed_position_ids, (0, pad), value=0)
+    packed_position_ids = packed_position_ids.view_as(tokens).long()
+
+    return {
+        "g1_position_ids": position_ids,
+        "g1_packed_position_ids": packed_position_ids,
+        "g1_attention_mask": attention_mask,
+        "g1_packed_attention_mask": packed_attention_mask,
+        "g1_attention_mask_applied": bool(getattr(args, "g1_megatron_ref_apply_dense_attention_mask", False)),
+    }
+
+
+def _patch_g1_openrlhf_dense_mask_attention(
+    unwrapped_model: GPTModel,
+    packed_attention_mask: torch.Tensor,
+) -> list[tuple[object, object]]:
+    """Temporarily replace TE THD core attention with a tiny dense-mask torch fallback."""
+    from .g1_fast import openrlhf_dense_mask_thd_attention
+
+    patched = []
+    for layer in getattr(unwrapped_model.decoder, "layers", []):
+        self_attention = getattr(layer, "self_attention", None)
+        core_attention = getattr(self_attention, "core_attention", None)
+        if core_attention is None:
+            continue
+
+        original_forward = core_attention.forward
+
+        def _dense_mask_forward(
+            core_self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=None,
+            attention_bias=None,
+            packed_seq_params=None,
+        ):
+            del attention_mask, attn_mask_type, attention_bias
+            if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+                raise ValueError("G1 dense-mask fallback only supports Megatron THD packed ref forward")
+            return openrlhf_dense_mask_thd_attention(
+                query,
+                key,
+                value,
+                packed_attention_mask,
+                softmax_scale=getattr(core_self, "softmax_scale", None),
+            )
+
+        core_attention.forward = types.MethodType(_dense_mask_forward, core_attention)
+        patched.append((core_attention, original_forward))
+
+    if not patched:
+        raise RuntimeError("Failed to patch any Megatron self-attention modules for G1 dense-mask fallback")
+    return patched
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -157,6 +266,9 @@ def forward_only(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     store_prefix: str = "",
+    *,
+    collect_hidden_states: bool = False,
+    extra_batch_keys: Sequence[str] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -205,34 +317,107 @@ def forward_only(
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
         # Get the batch.
+        batch_keys = [
+            "tokens",
+            "loss_masks",
+            "multimodal_train_inputs",
+            "total_lengths",
+            "response_lengths",
+            "max_seq_lens",
+        ]
+        if extra_batch_keys:
+            batch_keys.extend(key for key in extra_batch_keys if key not in batch_keys)
+
         batch = get_batch(
             data_iterator,
-            [
-                "tokens",
-                "loss_masks",
-                "multimodal_train_inputs",
-                "total_lengths",
-                "response_lengths",
-                "max_seq_lens",
-            ],
+            batch_keys,
             args.data_pad_size_multiplier,
             args.qkv_format,
             args.allgather_cp,
+            args=args,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
-        output_tensor = model(
-            input_ids=tokens,
-            position_ids=None,
-            attention_mask=None,
-            labels=None,
-            packed_seq_params=packed_seq_params,
-            loss_mask=batch["full_loss_masks"],
-            **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
-        )
+        exact_inputs = None
+        if (
+            collect_hidden_states
+            and getattr(args, "g1_megatron_ref_forward_mode", "standard") == "openrlhf_exact"
+        ):
+            exact_inputs = _build_g1_openrlhf_exact_inputs(
+                args,
+                unconcat_tokens=unconcat_tokens,
+                tokens=tokens,
+            )
+        captured_hidden: dict[str, torch.Tensor] = {}
+        handle = None
+        original_preprocess = None
+        patched_attentions = []
+        if collect_hidden_states:
+            unwrapped_model = _unwrap_model_for_hooks(model)
+            handle = unwrapped_model.decoder.register_forward_hook(
+                lambda _module, _inputs, output: captured_hidden.setdefault(
+                    "hidden_states",
+                    output[0] if isinstance(output, tuple) else output,
+                )
+            )
+            if exact_inputs is not None:
+                from .g1_fast import build_megatron_rotary_pos_emb_from_position_ids
+
+                original_preprocess = unwrapped_model._preprocess
+
+                def _preprocess_with_openrlhf_positions(*preprocess_args, **preprocess_kwargs):
+                    preprocess_kwargs["position_ids"] = exact_inputs["g1_packed_position_ids"]
+                    preproc_output = original_preprocess(*preprocess_args, **preprocess_kwargs)
+                    rotary_pos_emb = build_megatron_rotary_pos_emb_from_position_ids(
+                        unwrapped_model.rotary_pos_emb,
+                        exact_inputs["g1_packed_position_ids"],
+                    )
+                    # Dense mask application is handled by an optional ref-only
+                    # torch fallback around core attention, not by TE/thd.
+                    return (
+                        preproc_output[0],
+                        rotary_pos_emb,
+                        None,
+                        None,
+                        preproc_output[4],
+                    )
+
+                unwrapped_model._preprocess = _preprocess_with_openrlhf_positions
+                if bool(getattr(args, "g1_megatron_ref_apply_dense_attention_mask", False)):
+                    patched_attentions = _patch_g1_openrlhf_dense_mask_attention(
+                        unwrapped_model,
+                        exact_inputs["g1_packed_attention_mask"],
+                    )
+        try:
+            output_tensor = model(
+                input_ids=tokens,
+                position_ids=exact_inputs["g1_packed_position_ids"] if exact_inputs is not None else None,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=packed_seq_params,
+                loss_mask=batch["full_loss_masks"],
+                **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+            )
+        finally:
+            for core_attention, original_forward in patched_attentions:
+                core_attention.forward = original_forward
+            if original_preprocess is not None:
+                unwrapped_model._preprocess = original_preprocess
+            if handle is not None:
+                handle.remove()
+
+        extra_kwargs = {}
+        if collect_hidden_states:
+            if "hidden_states" not in captured_hidden:
+                raise RuntimeError("Failed to capture Megatron decoder hidden states for forward_only collector")
+            extra_kwargs["hidden_states"] = captured_hidden["hidden_states"]
+            if extra_batch_keys:
+                extra_kwargs.update({key: batch.get(key) for key in extra_batch_keys})
+            if exact_inputs is not None:
+                extra_kwargs.update(exact_inputs)
 
         return output_tensor, partial(
             f,
@@ -242,6 +427,7 @@ def forward_only(
             response_lengths=response_lengths,
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
+            **extra_kwargs,
         )
 
     # Turn on evaluation mode which disables dropout.
@@ -355,27 +541,34 @@ def train_one_step(
         """
 
         # Get the batch.
+        batch_keys = [
+            "tokens",
+            "multimodal_train_inputs",
+            "packed_seq_params",
+            "total_lengths",
+            "response_lengths",
+            "loss_masks",
+            "log_probs",
+            "ref_log_probs",
+            "values",
+            "advantages",
+            "returns",
+            "rollout_log_probs",
+            "max_seq_lens",
+            "teacher_log_probs",
+        ]
+        if bool(getattr(args, "g1_use_ebft_loss", False)):
+            for key in ("g1_full_sequences", "g1_qa_masks"):
+                if key not in batch_keys:
+                    batch_keys.append(key)
+
         batch = get_batch(
             data_iterator,
-            [
-                "tokens",
-                "multimodal_train_inputs",
-                "packed_seq_params",
-                "total_lengths",
-                "response_lengths",
-                "loss_masks",
-                "log_probs",
-                "ref_log_probs",
-                "values",
-                "advantages",
-                "returns",
-                "rollout_log_probs",
-                "max_seq_lens",
-                "teacher_log_probs",
-            ],
+            batch_keys,
             args.data_pad_size_multiplier,
             args.qkv_format,
             args.allgather_cp,
+            args=args,
         )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
