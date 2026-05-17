@@ -14,6 +14,13 @@
 - Megatron ref forward mode: `openrlhf_exact`
 - Megatron attention mask status: `openrlhf_dense_mask_built_not_applied_to_megatron_te_thd`
 - Megatron attention mask applied: `False`
+- `openrlhf_exact` active: `True`
+- Dense mask state: `dense-mask-built-not-applied`
+- Dense mask dumped: `True`
+- Dense mask built: `True`
+- `apply_dense_attention_mask` effective: `False`
+- THD fallback active: `False`
+- Runtime mask status consistency: `PASS`
 - Megatron hidden shape: `(1, 760, 2560)`
 - OpenRLHF hidden shape: `(1, 760, 2560)`
 - Megatron gen embedding shape: `(1, 47, 2560)`
@@ -73,4 +80,4 @@ not available
 
 This report compares the current Slime Megatron/ref fast path against OpenRLHF Critic on identical token IDs and QA masks.
 
-Tight tensor equality is expected only after both staged contracts pass: OpenRLHF position ids must drive Megatron RoPE, and EBFT dense strided mask semantics must reach the Megatron attention backend. If the report says the Megatron dense mask was built but not applied, remaining generated-block gaps should be treated as attention-mask work, not full exactness.
+Use the runtime mask status above to distinguish the staged contracts. `openrlhf_exact` means Megatron uses OpenRLHF-compatible position ids/RoPE inputs. `dense-mask-built-not-applied` means the OpenRLHF EBFT dense mask was dumped for comparison but did not affect Megatron attention. `applied-via-torch-thd-fallback` means `apply_dense_attention_mask` was effective through the slow diagnostic torch THD fallback, not the standard Megatron/TE `thd` fast path.

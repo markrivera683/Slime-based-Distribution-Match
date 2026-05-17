@@ -63,6 +63,53 @@ def test_early_validate_tokens_count_mismatch(c):
         c._early_validate_tokens_and_masks(meg, ohf)
 
 
+def test_extract_mask_status_built_not_applied(c):
+    status = c._extract_megatron_dense_mask_status(
+        {
+            "g1_megatron_ref_forward_mode": "openrlhf_exact",
+            "g1_attention_mask_status": c.BUILT_NOT_APPLIED_STATUS,
+            "g1_attention_mask_applied": False,
+            "g1_attention_mask_shape": (1, 1, 4, 4),
+        }
+    )
+    assert status.openrlhf_exact
+    assert status.dense_mask_built
+    assert not status.apply_dense_attention_mask
+    assert not status.thd_fallback
+    assert status.status_label == "dense-mask-built-not-applied"
+    assert status.consistency_ok
+
+
+def test_extract_mask_status_applied_via_torch_thd_fallback(c):
+    status = c._extract_megatron_dense_mask_status(
+        {
+            "g1_megatron_ref_forward_mode": "openrlhf_exact",
+            "g1_attention_mask_status": c.APPLIED_THD_FALLBACK_STATUS,
+            "g1_attention_mask_applied": True,
+            "g1_attention_mask": torch.zeros(1, 1, 4, 4),
+        }
+    )
+    assert status.openrlhf_exact
+    assert status.dense_mask_built
+    assert status.apply_dense_attention_mask
+    assert status.thd_fallback
+    assert status.status_label == "applied-via-torch-thd-fallback"
+    assert status.consistency_ok
+
+
+def test_extract_mask_status_flags_inconsistent_dump(c):
+    status = c._extract_megatron_dense_mask_status(
+        {
+            "g1_megatron_ref_forward_mode": "openrlhf_exact",
+            "g1_attention_mask_status": c.BUILT_NOT_APPLIED_STATUS,
+            "g1_attention_mask_applied": True,
+            "g1_attention_mask_shape": (1, 1, 4, 4),
+        }
+    )
+    assert not status.consistency_ok
+    assert any("built-not-applied" in error for error in status.consistency_errors)
+
+
 def test_check_embedding_family_pass(c):
     a = torch.randn(4, 5, 8)
     b = a.clone()
@@ -121,3 +168,50 @@ def test_cli_mismatch_exit_code(tmp_path):
     assert proc.returncode != 0
     joined = (proc.stderr + proc.stdout).lower()
     assert "shape mismatch" in joined or "hidden states" in joined
+
+
+def test_cli_report_writes_dense_mask_status_contract(tmp_path):
+    d1 = tmp_path / "m.pt"
+    d2 = tmp_path / "o.pt"
+    mask = torch.zeros(1, 1, 2, 2)
+    torch.save(
+        {
+            "tokens": [torch.tensor([1, 2])],
+            "g1_qa_masks": [torch.ones(2, dtype=torch.long)],
+            "hidden_states_post_sp_gather": torch.ones(2, 1, 4),
+            "total_lengths": [2],
+            "g1_gen_embedding": [torch.ones(1, 4)],
+            "g1_gt_embedding": [torch.ones(1, 4)],
+            "g1_megatron_ref_forward_mode": "openrlhf_exact",
+            "g1_position_ids": torch.tensor([[0, 1]]),
+            "g1_attention_mask": mask,
+            "g1_attention_mask_applied": False,
+            "g1_attention_mask_status": "openrlhf_dense_mask_built_not_applied_to_megatron_te_thd",
+        },
+        d1,
+    )
+    torch.save(
+        {
+            "sequences": torch.tensor([[1, 2]]).long(),
+            "qa_masks": torch.ones(1, 2, dtype=torch.long),
+            "hidden_states": torch.ones(1, 2, 1, 4),
+            "g1_gen_embedding": [torch.ones(1, 4)],
+            "g1_gt_embedding": [torch.ones(1, 4)],
+            "position_ids": torch.tensor([[0, 1]]),
+            "attention_mask": mask.clone(),
+        },
+        d2,
+    )
+    out = tmp_path / "r.md"
+    proc = subprocess.run(
+        [sys.executable, str(_COMPARE_PATH), "--megatron-dump", str(d1), "--openrlhf-dump", str(d2), "--out", str(out)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    report = out.read_text(encoding="utf-8")
+    assert "- `openrlhf_exact` active: `True`" in report
+    assert "- Dense mask state: `dense-mask-built-not-applied`" in report
+    assert "- `apply_dense_attention_mask` effective: `False`" in report
+    assert "- THD fallback active: `False`" in report
+    assert "- Runtime mask status consistency: `PASS`" in report

@@ -1,4 +1,5 @@
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 import torch
@@ -266,6 +267,50 @@ def _assert_fixed_embedding_parity(*, use_whitening: bool) -> None:
     torch.testing.assert_close(token_advantages, expected_token_advantages, rtol=1e-5, atol=1e-5)
 
 
+def _assert_megatron_g1_rollout_contract(train_data: dict, samples: list[Sample], args: Namespace) -> None:
+    expected_sequence_len = int(args.g1_prompt_length) + int(args.g1_response_length)
+    assert train_data["response_lengths"] == [int(args.g1_response_length)] * len(
+        samples
+    ), "rollout fixed response length contract changed before trainer-side G1"
+
+    assert len(train_data["g1_full_sequences"]) == len(samples), "rollout omitted g1_full_sequences for a sample"
+    assert len(train_data["g1_qa_masks"]) == len(samples), "rollout omitted g1_qa_masks for a sample"
+    for idx, (sample, full_sequence, qa_mask) in enumerate(
+        zip(samples, train_data["g1_full_sequences"], train_data["g1_qa_masks"], strict=True)
+    ):
+        assert len(full_sequence) == expected_sequence_len, (
+            f"rollout g1_full_sequences length mismatch at sample {idx}: "
+            f"{len(full_sequence)} != {expected_sequence_len}"
+        )
+        assert len(qa_mask) == expected_sequence_len, (
+            f"rollout g1_qa_masks length mismatch at sample {idx}: {len(qa_mask)} != {expected_sequence_len}"
+        )
+        assert full_sequence[-int(args.g1_response_length) :] == sample.tokens[-int(args.g1_response_length) :], (
+            f"rollout response token tail mismatch at sample {idx}"
+        )
+        assert qa_mask[-int(args.g1_response_length) :] == [1] * int(args.g1_response_length), (
+            f"rollout g1_qa_masks response tail is not all action tokens at sample {idx}"
+        )
+
+
+def _assert_dp_split_keeps_prompt_groups_together(refs: list, *, n_samples_per_prompt: int) -> None:
+    group_to_rank = {}
+    for rank, ref in enumerate(refs):
+        sample_indices = ref.inner["sample_indices"]
+        assert len(sample_indices) % n_samples_per_prompt == 0, (
+            f"DP split produced a partial G1 prompt group on rank {rank}: {sample_indices}"
+        )
+        for offset in range(0, len(sample_indices), n_samples_per_prompt):
+            chunk = sample_indices[offset : offset + n_samples_per_prompt]
+            group_ids = {idx // n_samples_per_prompt for idx in chunk}
+            assert len(group_ids) == 1, f"DP split broke a prompt group on rank {rank}: {chunk}"
+            group_id = group_ids.pop()
+            assert group_id not in group_to_rank, (
+                f"DP split sent prompt group {group_id} to both rank {group_to_rank[group_id]} and rank {rank}"
+            )
+            group_to_rank[group_id] = rank
+
+
 def test_get_num_strided_blocks_matches_diff_dataset_g1_geometry():
     assert get_num_strided_blocks(prompt_length=384, context_length=8, generate_length=8, stride=8) == 47
 
@@ -316,7 +361,10 @@ def test_g1_full_sequence_contract_requires_fixed_response_length():
         config=config,
     )
 
+    assert full_sequence.numel() == config.prompt_length + config.response_length
+    assert qa_mask.numel() == config.prompt_length + config.response_length
     torch.testing.assert_close(full_sequence, torch.tensor([1, 2, 3, 4, 0, 0, 5, 6, 5, 6]))
+    torch.testing.assert_close(full_sequence[-config.response_length :], torch.tensor(sample.tokens[-config.response_length :]))
     torch.testing.assert_close(doc_ids, torch.tensor([0, 0, 0, 0, -1, -1]))
     torch.testing.assert_close(qa_mask, torch.tensor([0, 0, 1, 1, 0, 0, 1, 1, 1, 1]))
 
@@ -602,6 +650,7 @@ def test_train_data_conversion_prepares_megatron_g1_sequences_without_rollout_ad
     assert "g1_token_advantages" not in train_data
     assert train_data["g1_full_sequences"][0] == [1, 2, 3, 4, 0, 0, 5, 6, 5, 6]
     assert train_data["g1_qa_masks"][0] == [0, 0, 1, 1, 0, 0, 1, 1, 1, 1]
+    _assert_megatron_g1_rollout_contract(train_data, samples, manager.args)
 
 
 def test_g1_advantage_estimator_consumes_precomputed_token_advantages(monkeypatch):
@@ -629,6 +678,32 @@ def test_g1_advantage_estimator_consumes_precomputed_token_advantages(monkeypatc
     torch.testing.assert_close(rollout_data["advantages"][0], torch.tensor([1.0, 2.0, 3.0]))
     torch.testing.assert_close(rollout_data["advantages"][1], torch.tensor([-1.0, -2.0, -3.0]))
     torch.testing.assert_close(rollout_data["returns"][0], rollout_data["advantages"][0])
+
+
+def test_g1_advantage_estimator_rejects_response_level_shape_mismatch(monkeypatch):
+    monkeypatch.setattr(loss_module.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+
+    rollout_data = {
+        "log_probs": [torch.zeros(4)],
+        "rewards": [0.0],
+        "g1_token_advantages": [torch.tensor([1.0, 2.0, 3.0])],
+        "response_lengths": [4],
+        "total_lengths": [6],
+        "loss_masks": [torch.ones(4)],
+    }
+
+    with pytest.raises(ValueError, match="G1 token advantage length 3 != response_length 4 at sample 0"):
+        loss_module.compute_advantages_and_returns(
+            Namespace(
+                use_rollout_logprobs=False,
+                kl_coef=0.0,
+                advantage_estimator="g1",
+                use_opd=False,
+                normalize_advantages=False,
+            ),
+            rollout_data,
+        )
 
 
 def test_group_g1_reward_rejects_response_lengths_not_aligned_to_blocks():
@@ -774,10 +849,19 @@ def test_split_train_data_by_dp_keeps_megatron_g1_prompt_groups_together(monkeyp
 
     assert refs[0].inner["sample_indices"] == [0, 1, 2, 3, 8, 9, 10, 11]
     assert refs[1].inner["sample_indices"] == [4, 5, 6, 7, 12, 13, 14, 15]
-    for ref in refs:
-        group_ids = [idx // 4 for idx in ref.inner["sample_indices"]]
-        assert group_ids[0:4] == [group_ids[0]] * 4
-        assert group_ids[4:8] == [group_ids[4]] * 4
+    _assert_dp_split_keeps_prompt_groups_together(refs, n_samples_per_prompt=4)
+
+
+def test_trainer_side_g1_keeps_sequences_when_ebft_enabled():
+    actor_source = (Path(__file__).resolve().parents[1] / "slime/backends/megatron_utils/actor.py").read_text(
+        encoding="utf-8"
+    )
+    cleanup_guard = 'if not bool(getattr(self.args, "g1_use_ebft_loss", False)):'
+    guard_idx = actor_source.index(cleanup_guard)
+    cleanup_block = actor_source[guard_idx : guard_idx + 260]
+
+    assert 'rollout_data.pop("g1_full_sequences", None)' in cleanup_block
+    assert 'rollout_data.pop("g1_qa_masks", None)' in cleanup_block
 
 
 def test_split_train_data_by_dp_rejects_megatron_g1_balance_data(monkeypatch):

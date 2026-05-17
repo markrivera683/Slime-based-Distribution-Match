@@ -6,7 +6,15 @@ in ``slime/utils/g1_ebft_data_contract.py``.
 
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
+
 import torch
+
+
+G1_EBFT_ACTOR_LOSS_DUMP_ENV = "G1_EBFT_ACTOR_LOSS_DUMP_PATH"
+G1_EBFT_ACTOR_LOSS_DUMP_FORMAT = "slime_g1_ebft_actor_loss_runtime_v1"
 
 
 def openrlhf_masked_mean(
@@ -211,3 +219,103 @@ def ebft_mean_rl_ce_over_packed_samples(
         ce_scalars.append(c_i)
 
     return torch.stack(rl_scalars).mean(), torch.stack(ce_scalars).mean()
+
+
+def _detach_cpu_tensor_list(values: list[torch.Tensor], *, dtype: torch.dtype | None = None) -> list[torch.Tensor]:
+    outs = []
+    for tensor in values:
+        out = tensor.detach().cpu()
+        if dtype is not None:
+            out = out.to(dtype=dtype)
+        outs.append(out.contiguous())
+    return outs
+
+
+def dump_ebft_actor_loss_runtime(
+    *,
+    path: str | os.PathLike[str],
+    per_sample_log_probs_next: list[torch.Tensor],
+    per_sample_adv_next: list[torch.Tensor],
+    per_sample_action_mask_next: list[torch.Tensor],
+    per_sample_qa_mask_next: list[torch.Tensor],
+    qa_masking: bool,
+    g1_ce_loss_coef: float,
+    slime_rl_loss: torch.Tensor,
+    slime_ce_loss: torch.Tensor,
+    slime_total_loss: torch.Tensor,
+    policy_loss_type: str = "ppo",
+    metadata: dict | None = None,
+) -> Path:
+    """Write a CPU runtime dump for one Slime EBFT actor-loss microbatch."""
+
+    dump_path = Path(path).expanduser()
+    dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "format": G1_EBFT_ACTOR_LOSS_DUMP_FORMAT,
+        "metadata": {
+            "qa_masking": bool(qa_masking),
+            "policy_loss_type": policy_loss_type,
+            **(metadata or {}),
+        },
+        "inputs": {
+            "log_probs_next": _detach_cpu_tensor_list(per_sample_log_probs_next),
+            "advantages_next": _detach_cpu_tensor_list(per_sample_adv_next),
+            "action_mask_next": _detach_cpu_tensor_list(per_sample_action_mask_next, dtype=torch.bool),
+            "qa_mask_next": _detach_cpu_tensor_list(per_sample_qa_mask_next, dtype=torch.bool),
+        },
+        "scalars": {
+            "g1_ce_loss_coef": float(g1_ce_loss_coef),
+            "slime_rl_loss": float(slime_rl_loss.detach().float().cpu().item()),
+            "slime_ce_loss": float(slime_ce_loss.detach().float().cpu().item()),
+            "slime_total_loss": float(slime_total_loss.detach().float().cpu().item()),
+        },
+    }
+
+    with tempfile.NamedTemporaryFile(prefix=f".{dump_path.name}.", suffix=".tmp", dir=dump_path.parent, delete=False) as f:
+        tmp_path = Path(f.name)
+
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, dump_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    return dump_path
+
+
+def maybe_dump_ebft_actor_loss_runtime(
+    *,
+    per_sample_log_probs_next: list[torch.Tensor],
+    per_sample_adv_next: list[torch.Tensor],
+    per_sample_action_mask_next: list[torch.Tensor],
+    per_sample_qa_mask_next: list[torch.Tensor],
+    qa_masking: bool,
+    g1_ce_loss_coef: float,
+    slime_rl_loss: torch.Tensor,
+    slime_ce_loss: torch.Tensor,
+    slime_total_loss: torch.Tensor,
+    policy_loss_type: str = "ppo",
+    metadata: dict | None = None,
+) -> Path | None:
+    """Opt-in runtime dump controlled by ``G1_EBFT_ACTOR_LOSS_DUMP_PATH``."""
+
+    dump_path = os.environ.get(G1_EBFT_ACTOR_LOSS_DUMP_ENV)
+    if not dump_path:
+        return None
+
+    return dump_ebft_actor_loss_runtime(
+        path=dump_path,
+        per_sample_log_probs_next=per_sample_log_probs_next,
+        per_sample_adv_next=per_sample_adv_next,
+        per_sample_action_mask_next=per_sample_action_mask_next,
+        per_sample_qa_mask_next=per_sample_qa_mask_next,
+        qa_masking=qa_masking,
+        g1_ce_loss_coef=g1_ce_loss_coef,
+        slime_rl_loss=slime_rl_loss,
+        slime_ce_loss=slime_ce_loss,
+        slime_total_loss=slime_total_loss,
+        policy_loss_type=policy_loss_type,
+        metadata=metadata,
+    )

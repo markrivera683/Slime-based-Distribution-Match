@@ -127,6 +127,8 @@ In `openrlhf/models/actor.py`, after `prepare_logprobs`, if `self.temperature !=
 
 ## 7. KL semantics
 
+The detailed Phase 3 KL contract lives in [`openrlhf_kl_parity_contract.md`](openrlhf_kl_parity_contract.md). That document is the source of truth for `base_action_log_probs` provenance, estimator/clamp semantics, global mask reduction, zero-coefficient short-circuit behavior, and why the existing Slime PPO KL path must not be reused directly.
+
 When `use_kl_loss` is true (`ebft_actor.py`):
 
 - If **`init_kl_coef > 0`**, OpenRLHF computes `kl = compute_approx_kl(action_log_probs, base_action_log_probs, kl_estimator=...)`.
@@ -148,7 +150,7 @@ with default **`dim=None`**: **global** mean over all batch/token positions wher
 
 Total contribution: `kl_loss * kl_ctl` (with `kl_ctl` from the trainer).
 
-**Slime requirement:** Match estimator name, **[-10, 10] clamp**, `float()` casting behavior in `compute_approx_kl`, and **global masked mean over generated tokens** using the same mask tensor semantics. When **`init_kl_coef == 0`**, match the **zeros tensor** short-circuit (no KL gradient through approximate KL).
+**Slime requirement:** Match estimator name, **[-10, 10] clamp**, `float()` casting behavior in `compute_approx_kl`, and **global masked mean over generated tokens** using the same mask tensor semantics. When **`init_kl_coef == 0`**, match the **zeros tensor** short-circuit (no KL gradient through approximate KL). Do not enable the Slime training combination `--g1-use-ebft-loss --use-kl-loss` until that dedicated OpenRLHF EBFT KL path exists.
 
 ---
 

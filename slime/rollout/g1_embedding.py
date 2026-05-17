@@ -419,7 +419,9 @@ async def generate_fixed_length_for_g1(
 ) -> Sample:
     """Generate strict fixed-length G1 responses without rollout-side embeddings."""
     if evaluation:
-        raise ValueError("G1 fixed-length generation is not supported during eval rollout")
+        # Evaluation does not feed trainer-side G1 embeddings, so keep eval's
+        # own max_response_len instead of forcing the training response length.
+        return await sglang_generate(args, sample, sampling_params)
     config = g1_embedding_config_from_args(args)
     sampling_params = dict(sampling_params)
     sampling_params["max_new_tokens"] = config.response_length

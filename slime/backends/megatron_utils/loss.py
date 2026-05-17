@@ -23,7 +23,11 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.g1_ebft_loss import ebft_mean_rl_ce_over_packed_samples
+from slime.utils.g1_ebft_loss import (
+    G1_EBFT_ACTOR_LOSS_DUMP_ENV,
+    ebft_mean_rl_ce_over_packed_samples,
+    maybe_dump_ebft_actor_loss_runtime,
+)
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -991,6 +995,29 @@ def policy_loss_function_g1_ebft(
 
     ce_coef = float(getattr(args, "g1_ce_loss_coef", 0.03))
     loss = rl_mean + ce_coef * ce_mean
+
+    if os.environ.get(G1_EBFT_ACTOR_LOSS_DUMP_ENV):
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        maybe_dump_ebft_actor_loss_runtime(
+            per_sample_log_probs_next=lp_per_sample,
+            per_sample_adv_next=[adv.to(dtype=dtype, device=device) for adv in batch["ebft_advantages_next"]],
+            per_sample_action_mask_next=[am.to(dtype=torch.bool, device=device) for am in batch["ebft_action_mask_next"]],
+            per_sample_qa_mask_next=[qm.to(dtype=torch.bool, device=device) for qm in batch["ebft_qa_mask_next"]],
+            qa_masking=qa_masking,
+            g1_ce_loss_coef=ce_coef,
+            slime_rl_loss=rl_mean,
+            slime_ce_loss=ce_mean,
+            slime_total_loss=loss,
+            policy_loss_type="ppo",
+            metadata={
+                "rank": rank,
+                "world_size": world_size,
+                "total_lengths": [int(x) for x in batch["total_lengths"]],
+                "response_lengths": [int(x) for x in batch.get("response_lengths", [])],
+                "seq_len_m1": [int(x) for x in batch.get("ebft_seq_len_m1", [])],
+            },
+        )
 
     zeros = logits.new_zeros(())
     metrics = {

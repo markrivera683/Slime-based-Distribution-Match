@@ -33,6 +33,35 @@ class AdvantageThresholds:
     rel_l2_max: float = 5e-2
 
 
+STANDARD_ATTENTION_STATUS = "standard_megatron_attention"
+BUILT_NOT_APPLIED_STATUS = "openrlhf_dense_mask_built_not_applied_to_megatron_te_thd"
+APPLIED_THD_FALLBACK_STATUS = "openrlhf_dense_mask_applied_via_torch_thd_fallback"
+NOT_DUMPED_STATUS = "not_dumped"
+KNOWN_ATTENTION_MASK_STATUSES = {
+    STANDARD_ATTENTION_STATUS,
+    BUILT_NOT_APPLIED_STATUS,
+    APPLIED_THD_FALLBACK_STATUS,
+    NOT_DUMPED_STATUS,
+}
+
+
+@dataclass(frozen=True)
+class MegatronDenseMaskStatus:
+    raw_status: str
+    ref_forward_mode: str
+    openrlhf_exact: bool
+    dense_mask_dumped: bool
+    dense_mask_built: bool
+    apply_dense_attention_mask: bool
+    thd_fallback: bool
+    status_label: str
+    consistency_errors: tuple[str, ...]
+
+    @property
+    def consistency_ok(self) -> bool:
+        return len(self.consistency_errors) == 0
+
+
 def _flatten_embeddings(values: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack([t.float() for t in values], dim=0)
 
@@ -135,6 +164,70 @@ def _mask_summary(mask: torch.Tensor | None) -> dict[str, object] | None:
         "blocked_count": int((~allowed).sum().item()),
         "finite_count": int(finite.sum().item()),
     }
+
+
+def _dump_has_dense_mask(megatron_dump: dict) -> bool:
+    return any(
+        megatron_dump.get(key) is not None
+        for key in (
+            "g1_attention_mask",
+            "g1_attention_mask_shape",
+            "g1_packed_attention_mask",
+            "g1_packed_attention_mask_shape",
+        )
+    )
+
+
+def _extract_megatron_dense_mask_status(megatron_dump: dict) -> MegatronDenseMaskStatus:
+    raw_status = str(megatron_dump.get("g1_attention_mask_status", NOT_DUMPED_STATUS))
+    ref_forward_mode = str(megatron_dump.get("g1_megatron_ref_forward_mode", "standard"))
+    openrlhf_exact = ref_forward_mode == "openrlhf_exact"
+    dense_mask_dumped = _dump_has_dense_mask(megatron_dump)
+    status_says_dense_mask = raw_status in {BUILT_NOT_APPLIED_STATUS, APPLIED_THD_FALLBACK_STATUS}
+    dense_mask_built = dense_mask_dumped or status_says_dense_mask
+    applied_flag = bool(megatron_dump.get("g1_attention_mask_applied", False))
+    thd_fallback = raw_status == APPLIED_THD_FALLBACK_STATUS
+    apply_dense_attention_mask = applied_flag and thd_fallback
+
+    if thd_fallback:
+        status_label = "applied-via-torch-thd-fallback"
+    elif dense_mask_built:
+        status_label = "dense-mask-built-not-applied"
+    elif openrlhf_exact:
+        status_label = "openrlhf_exact-no-dense-mask"
+    else:
+        status_label = "standard-megatron-attention"
+
+    errors: list[str] = []
+    if raw_status not in KNOWN_ATTENTION_MASK_STATUSES:
+        errors.append(f"unknown g1_attention_mask_status `{raw_status}`")
+    if status_says_dense_mask and not openrlhf_exact:
+        errors.append(
+            f"g1_attention_mask_status `{raw_status}` requires "
+            "`g1_megatron_ref_forward_mode=openrlhf_exact`"
+        )
+    if status_says_dense_mask and not dense_mask_dumped:
+        errors.append(f"g1_attention_mask_status `{raw_status}` says a dense mask exists, but no dense mask was dumped")
+    if raw_status == STANDARD_ATTENTION_STATUS and dense_mask_dumped:
+        errors.append("standard attention status conflicts with dumped g1 dense attention mask metadata")
+    if raw_status == BUILT_NOT_APPLIED_STATUS and applied_flag:
+        errors.append("dense mask is marked built-not-applied, but g1_attention_mask_applied is True")
+    if thd_fallback and not applied_flag:
+        errors.append("THD fallback status requires g1_attention_mask_applied=True")
+    if applied_flag and not thd_fallback:
+        errors.append("g1_attention_mask_applied=True requires THD fallback status")
+
+    return MegatronDenseMaskStatus(
+        raw_status=raw_status,
+        ref_forward_mode=ref_forward_mode,
+        openrlhf_exact=openrlhf_exact,
+        dense_mask_dumped=dense_mask_dumped,
+        dense_mask_built=dense_mask_built,
+        apply_dense_attention_mask=apply_dense_attention_mask,
+        thd_fallback=thd_fallback,
+        status_label=status_label,
+        consistency_errors=tuple(errors),
+    )
 
 
 def _early_validate_tokens_and_masks(megatron: dict, openrlhf: dict) -> tuple[torch.Tensor, torch.Tensor]:
@@ -274,6 +367,7 @@ def main() -> None:
     mask_match = _optional_attention_mask_semantic_equal(megatron.get("g1_attention_mask"), openrlhf.get("attention_mask"))
     megatron_mask_summary = _mask_summary(megatron.get("g1_attention_mask"))
     openrlhf_mask_summary = _mask_summary(openrlhf.get("attention_mask"))
+    mask_status = _extract_megatron_dense_mask_status(megatron)
 
     megatron_hidden = _sample_megatron_hidden(megatron)
     openrlhf_hidden = openrlhf["hidden_states"].squeeze(-2).float()
@@ -337,7 +431,9 @@ def main() -> None:
     if advantage_stats is not None:
         ok_adv, fail_adv = _check_advantage_family(advantage_stats, adv_thr)
 
-    gate_ok = ok_hidden and ok_gen and ok_gt and ok_rew and ok_adv
+    ok_mask_status = mask_status.consistency_ok
+    fail_mask_status = list(mask_status.consistency_errors)
+    gate_ok = ok_hidden and ok_gen and ok_gt and ok_rew and ok_adv and ok_mask_status
     thd_raw_shape = tuple(megatron["hidden_states_post_sp_gather"].shape)
     total_lengths = [int(x) for x in megatron["total_lengths"]]
     thd_sum = sum(total_lengths)
@@ -355,9 +451,15 @@ def main() -> None:
 - QA masks match: `{qa_match}`
 - Position ids match: `{position_match}`
 - Attention mask tensors match: `{mask_match}`
-- Megatron ref forward mode: `{megatron.get("g1_megatron_ref_forward_mode", "standard")}`
-- Megatron attention mask status: `{megatron.get("g1_attention_mask_status", "not_dumped")}`
-- Megatron attention mask applied: `{megatron.get("g1_attention_mask_applied", False)}`
+- Megatron ref forward mode: `{mask_status.ref_forward_mode}`
+- `openrlhf_exact` active: `{mask_status.openrlhf_exact}`
+- Dense mask state: `{mask_status.status_label}`
+- Dense mask dumped: `{mask_status.dense_mask_dumped}`
+- Dense mask built: `{mask_status.dense_mask_built}`
+- `apply_dense_attention_mask` effective: `{mask_status.apply_dense_attention_mask}`
+- THD fallback active: `{mask_status.thd_fallback}`
+- Megatron attention mask raw status: `{mask_status.raw_status}`
+- Runtime mask status consistency: `{'PASS' if mask_status.consistency_ok else 'FAIL'}`
 
 ## Full-Group Hidden (THD compact vs OpenRLHF)
 
@@ -377,6 +479,11 @@ Megatron stores sequence-parallel gathered hidden in THD form `hidden_states_pos
 
 - Megatron mask summary: `{megatron_mask_summary}`
 - OpenRLHF mask summary: `{openrlhf_mask_summary}`
+- Megatron mask status consistency detail:
+
+```text
+{chr(10).join(f"- {error}" for error in mask_status.consistency_errors) if not mask_status.consistency_ok else "(none)"}
+```
 
 ## Strict Parity Gate (thresholds)
 
@@ -393,12 +500,13 @@ Token advantages: `cosine_min>={adv_thr.cosine_min}`, `max_abs<={adv_thr.max_abs
 {_family_gate_line("GT embeddings", ok_gt, "embedding thresholds")}
 {_family_gate_line("Scalar rewards", None if reward_stats is None else ok_rew, "not present in both dumps" if reward_stats is None else "reward thresholds")}
 {_family_gate_line("Token advantages", None if advantage_stats is None else ok_adv, "not present in both dumps" if advantage_stats is None else "advantage thresholds")}
+{_family_gate_line("Megatron dense-mask status", ok_mask_status, "runtime dump metadata consistency")}
 - **Overall strict gate**: **{'PASS' if gate_ok else 'FAIL'}**
 
 ### Failure detail
 
 ```text
-{chr(10).join(fail_hidden + fail_gen + fail_gt + fail_rew + fail_adv) if not gate_ok else "(none)"}
+{chr(10).join(fail_hidden + fail_gen + fail_gt + fail_rew + fail_adv + fail_mask_status) if not gate_ok else "(none)"}
 ```
 
 ## Parity metrics
@@ -468,7 +576,7 @@ rel_l2               = {advantage_stats['rel_l2']:.8e}''' if advantage_stats is 
 
 This report compares the current Slime Megatron/ref fast path against OpenRLHF Critic on identical token IDs and QA masks.
 
-Tight tensor equality is expected only after both staged contracts pass: OpenRLHF position ids must drive Megatron RoPE, and EBFT dense strided mask semantics must reach the Megatron attention backend. If the report says the Megatron dense mask was built but not applied, remaining generated-block gaps should be treated as attention-mask work, not full exactness.
+Use the runtime mask status above to distinguish the staged contracts. `openrlhf_exact` means Megatron uses OpenRLHF-compatible position ids/RoPE inputs. `dense-mask-built-not-applied` means the OpenRLHF EBFT dense mask was dumped for comparison but did not affect Megatron attention. `applied-via-torch-thd-fallback` means `apply_dense_attention_mask` was effective through the slow diagnostic torch THD fallback, not the standard Megatron/TE `thd` fast path.
 """
     output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -182,6 +182,84 @@ exit_code: 0
 - CP>1.
 - Variable-length responses / early-stop samples.
 
+## 2026-05-16 Follow-up: Ray Log Archive and Metric Extraction
+
+Updated smoke entrypoint:
+
+```bash
+G1_USE_EBFT_LOSS=true \
+G1_APPLY_DENSE_ATTENTION_MASK=true \
+bash refactor_debugging/g1_plan/run_g1_megatron_ref_smoke.sh
+```
+
+The script now writes a reproducibility bundle under:
+
+```text
+${SMOKE_ARTIFACT_DIR:-$(dirname "${LOAD_PATH}")/smoke_artifacts}
+```
+
+Expected files:
+
+```text
+ray_job_driver.log              # full `ray job submit` stdout/stderr captured by tee
+ray_session_latest_logs.tgz     # complete Ray session_latest/logs archive
+smoke_metadata.json             # Slime/EBFT commits, branch/status, argv, core env
+argv.sh                         # shell-quoted submitted argv
+g1_smoke_metrics.json           # parsed train metrics and checks
+g1_smoke_metrics.md             # human-readable metric summary
+metrics_raw_lines.txt           # source, line number, and complete raw metric log lines
+metric_extract.{stdout,stderr}
+ray_job_exit_status.txt
+metric_extract_exit_status.txt
+```
+
+Metric extraction is handled by:
+
+```bash
+python refactor_debugging/g1_plan/extract_g1_smoke_metrics.py \
+  --require-metrics \
+  --ce-coef 0.03 \
+  --output-json /tmp/g1_smoke_metrics.json \
+  --output-md /tmp/g1_smoke_metrics.md \
+  --output-raw-lines /tmp/metrics_raw_lines.txt \
+  <ray_job_driver.log-or-Ray-log-files>
+```
+
+For Phase 1 EBFT loss smoke, the parser checks:
+
+```text
+loss ~= pg_loss + 0.03 * g1_ebft_ce_loss
+ppo_kl == 0
+entropy_loss == 0
+pg_clipfrac == 0
+```
+
+These zero values are expected placeholders for Phase 1: KL parity, entropy auxiliary loss, and PPO clipping are out of scope for the gated `--g1-use-ebft-loss` path.
+
+### Real Phase 1 EBFT evidence run
+
+Recorded in:
+
+```text
+refactor_debugging/g1_plan/g1_ebft_smoke_evidence_report.md
+```
+
+Key result:
+
+```text
+Job: raysubmit_iawYBacJcAgYXsME
+Artifact: /mnt/data/ebft-distribution-new/outputs/diff_dataset/g1_megatron_ref_smoke_phase1_evidence_0516_152210/smoke_artifacts
+metric_extract_exit_status: 0
+ray_job_exit_status: 0
+loss: 0.07911529392004013
+pg_loss: 9.313225746154785e-10
+g1_ebft_ce_loss: 2.637176513671875
+expected loss = pg_loss + 0.03 * g1_ebft_ce_loss = 0.07911529634147882
+abs_error: 2.421438688449129e-09
+```
+
+The artifact's `metrics_raw_lines.txt` has source path, line number, and complete raw metric line entries for both `ray_job_driver.log` and `job-driver-raysubmit_iawYBacJcAgYXsME.log`.
+
 ## Next Recommended Work
 
 1. Use `run_g1_megatron_ref_smoke.sh` as the canonical smoke entrypoint.

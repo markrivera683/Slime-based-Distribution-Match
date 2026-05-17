@@ -47,6 +47,7 @@ def test_qa_mask_shift_matches_openrlhf_slice():
     L = pl + rl
     qa = torch.zeros(L, dtype=torch.long)
     qa[:200] = 1
+    qa[pl - 1] = 1
     qa[pl:] = 1
     seq = torch.zeros(L, dtype=torch.long)
     resp_adv = torch.zeros(rl)
@@ -61,6 +62,8 @@ def test_qa_mask_shift_matches_openrlhf_slice():
     )
     expected = qa[1:].ne(0)
     assert torch.equal(qa_next, expected)
+    assert qa_next[pl - 2].item() == bool(qa[pl - 1]), "QA mask shift lost the final prompt token"
+    assert qa_next[pl - 1].item() == bool(qa[pl]), "QA mask shift lost the first response token"
 
 
 def test_qa_masking_off_matches_openrlhf_ones():
@@ -94,7 +97,12 @@ def test_maybe_attach_populates_lists():
     assert "ebft_action_mask_next" in batch
     assert len(batch["ebft_action_mask_next"]) == 2
     assert batch["ebft_action_mask_next"][0].shape == (L - 1,)
+    assert batch["ebft_qa_mask_next"][0].shape == (L - 1,)
+    assert batch["ebft_advantages_next"][0].shape == (L - 1,)
     assert batch["ebft_seq_len_m1"] == [L - 1, L - 1]
+    assert batch["ebft_action_mask_next"][0].sum().item() == rl
+    assert not batch["ebft_action_mask_next"][0][: pl - 1].any()
+    assert batch["ebft_action_mask_next"][0][pl - 1 : pl - 1 + rl].all()
     torch.testing.assert_close(batch["ebft_advantages_next"][1][pl - 1 : pl - 1 + rl], batch["advantages"][1])
 
 
@@ -107,6 +115,39 @@ def test_build_rejects_length_mismatch():
             g1_prompt_length=384,
             g1_response_length=376,
         )
+
+
+def test_build_rejects_response_advantage_length_mismatch():
+    pl, rl = 384, 376
+    with pytest.raises(ValueError, match="response_advantages length 375 != g1_response_length"):
+        build_ebft_g1_next_token_tensors(
+            g1_full_sequence=torch.zeros(pl + rl),
+            g1_qa_mask=torch.ones(pl + rl),
+            response_advantages=torch.zeros(rl - 1),
+            g1_prompt_length=pl,
+            g1_response_length=rl,
+        )
+
+
+def test_attach_rejects_per_sample_advantage_shape_mismatch():
+    pl, rl = 384, 376
+    L = pl + rl
+    ns = Namespace(
+        g1_use_ebft_loss=True,
+        g1_prompt_length=pl,
+        g1_response_length=rl,
+        g1_qa_masking=True,
+    )
+    batch = {
+        "advantages": [torch.ones(rl - 1)],
+        "response_lengths": [rl],
+        "total_lengths": [L],
+        "g1_full_sequences": [torch.zeros(L, dtype=torch.long)],
+        "g1_qa_masks": [torch.ones(L, dtype=torch.long)],
+    }
+
+    with pytest.raises(ValueError, match="response_advantages length 375 != g1_response_length"):
+        attach_ebft_g1_next_token_contract_to_batch(batch, ns)
 
 
 def test_maybe_attach_no_op_without_flag():

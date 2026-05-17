@@ -46,7 +46,11 @@ In `g1_runtime_parity_report_mask_applied_full_group_compact.md`, check:
 ```text
 Position ids match: True
 Attention mask tensors match: True
-Megatron attention mask applied: True
+`openrlhf_exact` active: True
+Dense mask state: applied-via-torch-thd-fallback
+`apply_dense_attention_mask` effective: True
+THD fallback active: True
+Runtime mask status consistency: PASS
 ```
 
-For the full-group mask-applied run, `Megatron attention mask applied` should be `True`, and reward/advantage sections should no longer be `not available`.
+For the full-group mask-applied run, `apply_dense_attention_mask` should be effective only through `applied-via-torch-thd-fallback`; the report should not imply that the standard Megatron/TE `thd` fast path consumed the dense mask. Reward/advantage sections should no longer be `not available`.
