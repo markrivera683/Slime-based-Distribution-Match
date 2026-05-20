@@ -150,6 +150,75 @@ def build_g1_full_sequence_inputs(
     return full_sequence, doc_ids_prompt, qa_masks
 
 
+def build_g1_teacher_full_sequence_inputs(
+    *,
+    tokenizer: Any,
+    sample: Sample,
+    teacher_completions: list[str],
+    config: G1EmbeddingConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack remote teacher completions into the OpenRLHF G2 block-aligned layout.
+
+    Returns ``(full_sequences, qa_masks)`` shaped ``[M, prompt_length + response_length]``.
+    Teacher answers replace the packed prompt's QA answer span, then the response
+    region is built from strided prompt blocks instead of raw completion order.
+    """
+    if not teacher_completions:
+        raise ValueError("G2 teacher completion list must be non-empty")
+    if config.response_length != config.num_blocks * config.generate_length:
+        raise ValueError(
+            f"G2 teacher response_length {config.response_length} != num_blocks*generate_length "
+            f"{config.num_blocks * config.generate_length}"
+        )
+
+    prompt_ids, doc_ids_prompt, qa_prompt = build_g1_prompt_inputs(
+        tokenizer=tokenizer,
+        sample=sample,
+        config=config,
+    )
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad_id is None:
+        raise ValueError("G2 teacher tokenizer must define pad_token_id or eos_token_id")
+
+    teacher_prompt = prompt_ids.unsqueeze(0).expand(len(teacher_completions), -1).clone()
+    present_doc_ids = [int(doc_id) for doc_id in doc_ids_prompt.unique().tolist() if int(doc_id) >= 0]
+    tokenized_answers = [
+        list(tokenizer.encode(str(completion), add_special_tokens=False)) for completion in teacher_completions
+    ]
+    for doc_id in present_doc_ids:
+        answer_positions = ((doc_ids_prompt == doc_id) & (qa_prompt == 1)).nonzero(as_tuple=True)[0]
+        if answer_positions.numel() == 0:
+            continue
+
+        answer_start = int(answer_positions[0].item())
+        answer_len = int(answer_positions.numel())
+        for answer_idx, answer_ids in enumerate(tokenized_answers):
+            fill_len = min(answer_len, len(answer_ids))
+            if fill_len > 0:
+                teacher_prompt[answer_idx, answer_start : answer_start + fill_len] = torch.tensor(
+                    answer_ids[:fill_len],
+                    dtype=torch.long,
+                )
+            if fill_len < answer_len:
+                teacher_prompt[answer_idx, answer_start + fill_len : answer_start + answer_len] = int(pad_id)
+
+    strided_qa = qa_prompt[config.context_length :].unfold(0, config.generate_length, config.stride).t().reshape(-1)
+    full_sequences: list[torch.Tensor] = []
+    qa_masks: list[torch.Tensor] = []
+    for prompt_variant in teacher_prompt:
+        block_tokens = []
+        for block_idx in range(config.num_blocks):
+            start = config.context_length + block_idx * config.stride
+            end = start + config.generate_length
+            block_tokens.append(prompt_variant[start:end])
+
+        gen_region = torch.stack(block_tokens, dim=0).t().reshape(-1)
+        full_sequences.append(torch.cat([prompt_ids, gen_region], dim=0))
+        qa_masks.append(torch.cat([qa_prompt, strided_qa], dim=0))
+
+    return torch.stack(full_sequences, dim=0), torch.stack(qa_masks, dim=0)
+
+
 def _groom_last_token(
     block_hidden_states: torch.Tensor,
     block_qa_mask: torch.Tensor,

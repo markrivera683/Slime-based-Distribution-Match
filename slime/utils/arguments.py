@@ -754,6 +754,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--critic-load", type=str, default=None, help="The checkpoint for critic model.")
             parser.add_argument("--critic-save", type=str, default=None, help="The checkpoint for critic model.")
             parser.add_argument("--critic-lr", type=float, default=None, help="The lr for critic model")
+            parser.add_argument(
+                "--critic-lr-head",
+                type=float,
+                default=None,
+                help=(
+                    "Learning rate for the critic value head. Slime currently implements the standard G2 "
+                    "frozen-head case only: set to 0 to freeze critic output_layer parameters."
+                ),
+            )
             parser.add_argument("--critic-train-only", action="store_true", default=False, help="Only train critic")
             parser.add_argument(
                 "--critic-lr-warmup-iters",
@@ -1223,6 +1232,103 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--distribution-reward-type",
+                type=str,
+                choices=["pointwise", "cf_l1oo"],
+                default="pointwise",
+                help=(
+                    "Distribution reward construction. 'pointwise' preserves existing G1 behavior; "
+                    "'cf_l1oo' enables the standard G2 reward core."
+                ),
+            )
+            parser.add_argument(
+                "--cf-target-mode",
+                type=str,
+                choices=["single", "teacher"],
+                default=None,
+                help="G2 target mode. Use 'single' for no-teacher distribution matching or 'teacher' for teacher target mode.",
+            )
+            parser.add_argument(
+                "--cf-target-num-refs",
+                type=int,
+                default=1,
+                help="Number of GT target refs for G2 no-teacher/vicinal-compatible configs. single mode uses 1.",
+            )
+            parser.add_argument(
+                "--cf-target-std",
+                type=float,
+                default=0.05,
+                help="Reserved smoothing scale for G2 target construction; single mode ignores it.",
+            )
+            parser.add_argument(
+                "--cf-target-seed",
+                type=int,
+                default=43,
+                help="Reserved target construction seed for G2 target construction; single mode ignores it.",
+            )
+            parser.add_argument("--cf-num-freqs", type=int, default=128, help="Number of CF random frequencies for G2.")
+            parser.add_argument("--cf-sigma", type=float, default=1.0, help="CF frequency Gaussian sigma for G2.")
+            parser.add_argument("--cf-seed", type=int, default=43, help="CF frequency seed for G2.")
+            parser.add_argument("--cf-alpha", type=float, default=0.5, help="CF amplitude discrepancy weight for G2.")
+            parser.add_argument("--cf-beta", type=float, default=0.5, help="CF phase discrepancy weight for G2.")
+            parser.add_argument("--cf-reward-scale", type=float, default=1.0, help="Reward scale for G2 cf_l1oo.")
+            parser.add_argument(
+                "--cf-teacher-lambda",
+                type=float,
+                default=0.6,
+                help="Teacher target mixture weight for standard G2 cf_l1oo teacher mode.",
+            )
+            parser.add_argument(
+                "--cf-teacher-n-samples",
+                type=int,
+                default=4,
+                help="Number of online teacher completions per prompt for standard G2.",
+            )
+            parser.add_argument(
+                "--teacher-backend",
+                type=str,
+                choices=["remote"],
+                default=None,
+                help="Standard G2 online teacher backend. Only remote vLLM/OpenAI-compatible teacher is in scope.",
+            )
+            parser.add_argument("--teacher-api-base", type=str, default=None, help="Comma-separated remote teacher /v1 base URLs.")
+            parser.add_argument("--teacher-api-key", type=str, default="EMPTY", help="Remote teacher API key.")
+            parser.add_argument(
+                "--teacher-api-style",
+                type=str,
+                choices=["completions", "chat_completions", "sglang_generate"],
+                default="completions",
+                help="Remote teacher API style. Use sglang_generate for SGLang /generate.",
+            )
+            parser.add_argument("--teacher-model-name", type=str, default=None, help="Remote teacher served model name.")
+            parser.add_argument("--teacher-timeout", type=int, default=120, help="Remote teacher HTTP timeout.")
+            parser.add_argument("--teacher-max-retries", type=int, default=3, help="Remote teacher max retries.")
+            parser.add_argument(
+                "--teacher-remote-batch-size",
+                type=int,
+                default=8,
+                help=(
+                    "Remote teacher request batch size. For sglang_generate this controls the fallback max "
+                    "concurrent /generate requests when native multi-sample is disabled or unsupported."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-sglang-multi-sample",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "For sglang_generate, request cf_teacher_n_samples completions in one /generate call by "
+                    "setting sampling_params.n. Use --no-teacher-sglang-multi-sample to force one request per sample."
+                ),
+            )
+            parser.add_argument("--teacher-temperature", type=float, default=0.7, help="Remote teacher sampling temperature.")
+            parser.add_argument("--teacher-top-p", type=float, default=0.95, help="Remote teacher sampling top-p.")
+            parser.add_argument("--teacher-max-new-tokens", type=int, default=512, help="Remote teacher max completion tokens.")
+            parser.add_argument("--teacher-system-prompt-text", type=str, default="", help="System prompt injected into teacher calls.")
+            parser.add_argument("--teacher-system-prompt-id", type=str, default="", help="Cache key ID for teacher system prompt.")
+            parser.add_argument("--teacher-cache-enable", action="store_true", default=False, help="Enable G2 teacher cache.")
+            parser.add_argument("--teacher-cache-dir", type=str, default=None, help="Directory for G2 teacher cache.")
+            parser.add_argument(
                 "--alignment-rew-coef",
                 type=float,
                 default=1.0,
@@ -1277,7 +1383,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="rollout",
                 help=(
                     "Source for G1 embeddings. 'rollout' keeps the temporary custom_generate path; "
-                    "'megatron_ref' computes embeddings from the frozen Megatron ref snapshot during training."
+                    "'megatron_ref' computes pointwise G1 embeddings from the frozen Megatron ref snapshot during "
+                    "training. In standard G2, the same trainer-side contract is fulfilled by the frozen critic."
                 ),
             )
             parser.add_argument(
@@ -1654,7 +1761,7 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def assert_g1_megatron_ref_trainer_stable_microbatch_order(args) -> None:
-    """Megatron/ref G1 with trainer-side grouping requires rollout sample ordering preserved."""
+    """Trainer-side G1/G2 grouping requires rollout sample ordering preserved."""
     if (
         (
             getattr(args, "advantage_estimator", None) == "g1"
@@ -1667,14 +1774,67 @@ def assert_g1_megatron_ref_trainer_stable_microbatch_order(args) -> None:
         raise ValueError(
             "advantage_estimator='g1' with g1_embedding_source='megatron_ref' and g1_reward_location='trainer' "
             "requires rollout samples to remain in strict group order (`n_samples_per_prompt` contiguous) through "
-            "the Megatron data iterator so RLOO grouping in compute_g1_token_advantages_from_embeddings matches prompts. "
+            "the Megatron data iterator so reward grouping in compute_g1_token_advantages_from_embeddings matches prompts. "
             "`use_dynamic_batch_size` reshuffles indices into token-balanced micro-batches, which can break that invariant. "
             "Disable `--use-dynamic-batch-size` for this combination (use fixed `--micro-batch-size`)."
         )
 
 
+def assert_g2_standard_args(args) -> None:
+    """Validate the intentionally narrow standard G2 surface."""
+    if getattr(args, "distribution_reward_type", "pointwise") != "cf_l1oo":
+        return
+
+    cf_target_mode = getattr(args, "cf_target_mode", None)
+    if cf_target_mode not in {"single", "teacher"}:
+        raise ValueError("G2 requires --distribution-reward-type cf_l1oo with --cf-target-mode single or teacher.")
+    if getattr(args, "advantage_estimator", None) != "g1":
+        raise ValueError("Standard G2 currently reuses Slime's token-advantage path; set --advantage-estimator g1.")
+    if getattr(args, "g1_embedding_source", "rollout") != "megatron_ref" or getattr(args, "g1_reward_location", "rollout") != "trainer":
+        raise ValueError(
+            "Standard G2 cf_l1oo requires trainer-side frozen critic embeddings: "
+            "set --g1-embedding-source megatron_ref --g1-reward-location trainer."
+        )
+    if cf_target_mode == "single":
+        if getattr(args, "teacher_backend", None) is not None:
+            raise ValueError("G2 no-teacher distribution mode should not set --teacher-backend.")
+        if getattr(args, "teacher_api_base", None) or getattr(args, "teacher_model_name", None):
+            raise ValueError("G2 no-teacher distribution mode should not set teacher API arguments.")
+        if float(getattr(args, "cf_teacher_lambda", 0.0)) != 0.0:
+            raise ValueError("G2 no-teacher distribution mode requires --cf-teacher-lambda 0.")
+        if getattr(args, "use_opd", False):
+            raise ValueError("G2 no-teacher distribution mode does not support OPD; remove --use-opd.")
+    else:
+        if getattr(args, "teacher_backend", None) != "remote":
+            raise ValueError("Standard G2 requires --teacher-backend remote.")
+        if not getattr(args, "teacher_api_base", None):
+            raise ValueError("Standard G2 remote teacher requires --teacher-api-base.")
+        if not getattr(args, "teacher_model_name", None):
+            raise ValueError("Standard G2 remote teacher requires --teacher-model-name.")
+        if int(getattr(args, "cf_teacher_n_samples", 0)) <= 0:
+            raise ValueError("--cf-teacher-n-samples must be positive for standard G2.")
+        cf_teacher_lambda = float(getattr(args, "cf_teacher_lambda", 0.0))
+        if cf_teacher_lambda <= 0.0 or cf_teacher_lambda > 1.0:
+            raise ValueError("--cf-teacher-lambda must be in (0, 1] for standard G2.")
+    if not bool(getattr(args, "use_whitening", False)):
+        raise ValueError("Standard G2 requires --use-whitening to match OpenRLHF reward construction.")
+    if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) != "sglang":
+        raise ValueError(
+            "Standard G2 cf_l1oo can only be combined with SGLang OPD teacher_log_probs; "
+            "set --opd-type sglang or remove --use-opd."
+        )
+    if float(getattr(args, "critic_lr", 0.0)) != 0.0:
+        raise ValueError("Standard G2 requires --critic-lr 0 so only the critic body/value path is used as intended.")
+    if float(getattr(args, "critic_lr_head", 0.0)) != 0.0:
+        raise ValueError("Standard G2 requires --critic-lr-head 0 to freeze the critic head.")
+    zero_stage = getattr(args, "zero_stage", None)
+    if zero_stage is not None and int(zero_stage) != 3:
+        raise ValueError("Standard G2 expects --zero-stage 3.")
+
+
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+    is_standard_g2 = getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
 
     if args.use_slime_router:
         logger.warning(
@@ -1784,7 +1944,14 @@ def slime_validate_args(args):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
+    if is_standard_g2:
+        if args.critic_lr is None:
+            args.critic_lr = 0.0
+        if args.critic_lr_head is None:
+            args.critic_lr_head = 0.0
+
     assert_g1_megatron_ref_trainer_stable_microbatch_order(args)
+    assert_g2_standard_args(args)
 
     if bool(getattr(args, "g1_use_ebft_loss", False)):
         if getattr(args, "loss_type", None) != "policy_loss":
@@ -1820,7 +1987,7 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    args.use_critic = args.advantage_estimator == "ppo" or is_standard_g2
     if args.critic_train_only:
         if not args.use_critic:
             raise ValueError("--critic-train-only requires --use-critic (or --advantage-estimator ppo).")
@@ -1837,6 +2004,11 @@ def slime_validate_args(args):
         args.critic_load = args.load
     if args.critic_lr is None:
         args.critic_lr = args.lr
+    if args.critic_lr_head is not None and float(args.critic_lr_head) != 0.0 and float(args.critic_lr_head) != float(args.critic_lr):
+        raise NotImplementedError(
+            "Separate nonzero --critic-lr-head parameter groups are not implemented in Slime yet. "
+            "Use --critic-lr-head 0 for the standard G2 frozen-head case, or leave it unset."
+        )
 
     if args.offload:
         args.offload_train = True

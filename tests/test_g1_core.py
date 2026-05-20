@@ -1,3 +1,4 @@
+import json
 from argparse import Namespace
 from pathlib import Path
 
@@ -11,11 +12,19 @@ from slime.rollout.g1_embedding import (
     assert_g1_critic_checkpoint_is_transformers_hf,
     build_g1_full_sequence_inputs,
     build_g1_prompt_inputs,
+    build_g1_teacher_full_sequence_inputs,
     hidden_states_to_g1_embeddings,
+)
+from slime.rollout.g2_teacher import (
+    G2RemoteTeacherClient,
+    G2RemoteTeacherConfig,
+    G2TeacherCache,
+    attach_g2_teacher_completions,
 )
 from slime.ray import rollout as rollout_module
 from slime.ray.rollout import RolloutManager
 from slime.backends.megatron_utils import data as data_module
+from slime.backends.megatron_utils import g1_fast as g1_fast_module
 from slime.backends.megatron_utils import loss as loss_module
 from slime.backends.megatron_utils.g1_fast import (
     build_megatron_rotary_pos_emb_from_position_ids,
@@ -34,6 +43,7 @@ from slime.utils.g1_core import (
     prepare_strided_token_blocks,
     whiten_embeddings_batched,
 )
+from slime.utils.g2_core import compute_cf_l1oo_rewards
 from slime.utils.types import Sample
 
 
@@ -373,6 +383,32 @@ def test_g1_full_sequence_contract_requires_fixed_response_length():
         build_g1_full_sequence_inputs(tokenizer=_FakeTokenizer(), sample=sample, config=config)
 
 
+def test_g1_teacher_full_sequence_contract_replaces_answer_span_and_strides_blocks():
+    config = G1EmbeddingConfig(
+        prompt_length=6,
+        context_length=2,
+        generate_length=2,
+        stride=2,
+        response_length=4,
+        n_samples_per_prompt=2,
+    )
+    sample = Sample(prompt="ab", label="cd")
+
+    full_sequences, qa_masks = build_g1_teacher_full_sequence_inputs(
+        tokenizer=_FakeTokenizer(),
+        sample=sample,
+        teacher_completions=["x", "xy", "yxy"],
+        config=config,
+    )
+
+    assert full_sequences.shape[0] == 3
+    assert config.n_samples_per_prompt == 2
+    torch.testing.assert_close(full_sequences[0], torch.tensor([1, 2, 3, 4, 0, 0, 5, 0, 0, 0]))
+    torch.testing.assert_close(full_sequences[1], torch.tensor([1, 2, 3, 4, 0, 0, 5, 0, 6, 0]))
+    torch.testing.assert_close(full_sequences[2], torch.tensor([1, 2, 3, 4, 0, 0, 6, 0, 5, 0]))
+    torch.testing.assert_close(qa_masks[0], torch.tensor([0, 0, 1, 1, 0, 0, 1, 0, 1, 0]))
+
+
 def test_hidden_states_to_g1_embeddings_matches_openrlhf_block_order():
     config = G1EmbeddingConfig(prompt_length=8, context_length=2, generate_length=2, stride=2, response_length=6)
     hidden_states = torch.arange(14, dtype=torch.float32).reshape(1, 14, 1, 1)
@@ -651,6 +687,68 @@ def test_train_data_conversion_prepares_megatron_g1_sequences_without_rollout_ad
     assert train_data["g1_full_sequences"][0] == [1, 2, 3, 4, 0, 0, 5, 6, 5, 6]
     assert train_data["g1_qa_masks"][0] == [0, 0, 1, 1, 0, 0, 1, 1, 1, 1]
     _assert_megatron_g1_rollout_contract(train_data, samples, manager.args)
+
+
+def test_train_data_conversion_prepares_g2_teacher_sequences(monkeypatch):
+    from slime.utils import processing_utils
+
+    monkeypatch.setattr(processing_utils, "load_tokenizer", lambda *args, **kwargs: _FakeTokenizer())
+    rollout_manager_class = getattr(getattr(RolloutManager, "__ray_metadata__", None), "modified_class", RolloutManager)
+    manager = object.__new__(rollout_manager_class)
+    manager.args = Namespace(
+        reward_key=None,
+        advantage_estimator="g1",
+        rewards_normalization=False,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="teacher",
+        teacher_backend="remote",
+        cf_teacher_n_samples=2,
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        g1_tokenizer_path="unused",
+        hf_checkpoint="unused",
+        g1_prompt_length=6,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_response_length=4,
+        n_samples_per_prompt=2,
+        g1_openrlhf_repo="/unused",
+        g1_hidden_state_method="last_only",
+        g1_embedding_device="cuda",
+        g1_embedding_dtype="bfloat16",
+        g1_qa_masking=False,
+        g1_document_masking=False,
+    )
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = None
+    samples = [
+        Sample(
+            index=0,
+            prompt="ab",
+            label="cd",
+            tokens=[1, 2, 5, 6, 5, 6],
+            response_length=4,
+            reward=0.0,
+            metadata={"g2_teacher_completions": ["xy", "yx"]},
+        ),
+        Sample(
+            index=1,
+            prompt="ab",
+            label="cd",
+            tokens=[1, 2, 6, 5, 6, 5],
+            response_length=4,
+            reward=0.0,
+            metadata={"g2_teacher_completions": ["xy", "yx"]},
+        ),
+    ]
+
+    train_data = rollout_manager_class._convert_samples_to_train_data(manager, samples)
+
+    assert train_data["g2_teacher_full_sequences"][0] == train_data["g2_teacher_full_sequences"][1]
+    assert train_data["g2_teacher_full_sequences"][0][0] == [1, 2, 3, 4, 0, 0, 5, 0, 6, 0]
+    assert train_data["g2_teacher_full_sequences"][0][1] == [1, 2, 3, 4, 0, 0, 6, 0, 5, 0]
+    assert train_data["g2_teacher_qa_masks"][0][0] == [0, 0, 1, 1, 0, 0, 1, 0, 1, 0]
 
 
 def test_g1_advantage_estimator_consumes_precomputed_token_advantages(monkeypatch):
@@ -1121,3 +1219,285 @@ def test_assert_g1_critic_checkpoint_accepts_hf_native_config(tmp_path):
 def test_assert_g1_critic_checkpoint_missing_config_json(tmp_path):
     with pytest.raises(ValueError, match="config.json"):
         assert_g1_critic_checkpoint_is_transformers_hf(str(tmp_path))
+
+
+def test_g2_cf_l1oo_teacher_rewards_shape_and_nonzero():
+    gen = torch.tensor(
+        [[[[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.6], [0.7, 0.8]], [[0.2, 0.9], [0.4, 0.1]]]]],
+        dtype=torch.float32,
+    )
+    gt = torch.tensor(
+        [[[[[0.0, 0.1], [0.2, 0.3]], [[0.0, 0.1], [0.2, 0.3]], [[0.0, 0.1], [0.2, 0.3]]]]],
+        dtype=torch.float32,
+    )
+    teacher = torch.tensor(
+        [[[[[0.9, 0.1], [0.8, 0.2]], [[0.7, 0.3], [0.6, 0.4]]]]],
+        dtype=torch.float32,
+    )
+
+    rewards = compute_cf_l1oo_rewards(
+        gen,
+        gt,
+        teacher_embedding=teacher,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_teacher_lambda=0.6,
+    )
+
+    assert tuple(rewards.shape) == (1, 1, 3, 2)
+    assert torch.isfinite(rewards).all()
+    assert rewards.abs().sum() > 0
+
+
+def test_g2_trainer_side_cf_l1oo_requires_teacher_embeddings():
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="teacher",
+        g1_response_length=2,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        cf_teacher_lambda=0.6,
+    )
+    gen_embeddings = [torch.ones(1, 2), torch.ones(1, 2) * 2]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+
+    with pytest.raises(NotImplementedError, match="g2_teacher_gen_embeddings"):
+        compute_g1_token_advantages_from_embeddings(args, gen_embeddings, gt_embeddings, [2, 2])
+
+
+def test_g2_trainer_side_cf_l1oo_rejects_inconsistent_group_teacher_embeddings():
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="teacher",
+        g1_response_length=2,
+        use_whitening=False,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        cf_teacher_lambda=0.6,
+    )
+    gen_embeddings = [torch.ones(1, 2), torch.ones(1, 2) * 2]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+    teacher = torch.ones(2, 1, 2)
+
+    with pytest.raises(ValueError, match="identical group-level teacher embeddings"):
+        compute_g1_token_advantages_from_embeddings(
+            args,
+            gen_embeddings,
+            gt_embeddings,
+            [2, 2],
+            teacher_gen_embeddings=[teacher, teacher + 0.1],
+        )
+
+
+def test_g2_trainer_side_cf_l1oo_requires_use_whitening():
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="teacher",
+        g1_response_length=2,
+        use_whitening=False,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        cf_teacher_lambda=0.6,
+    )
+    gen_embeddings = [torch.ones(1, 2), torch.ones(1, 2) * 2]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+    teacher = torch.ones(3, 1, 2)
+
+    with pytest.raises(ValueError, match="requires --use-whitening"):
+        compute_g1_token_advantages_from_embeddings(
+            args,
+            gen_embeddings,
+            gt_embeddings,
+            [2, 2],
+            teacher_gen_embeddings=[teacher, teacher.clone()],
+        )
+
+
+def test_g2_trainer_side_cf_l1oo_allows_teacher_sample_count_different_from_actor(monkeypatch):
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="teacher",
+        g1_response_length=2,
+        use_whitening=True,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        cf_teacher_lambda=0.6,
+    )
+    gen_embeddings = [
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        torch.tensor([[0.5, 0.5], [0.2, 0.8]]),
+    ]
+    gt_embeddings = [
+        torch.tensor([[0.8, 0.1], [0.1, 0.9]]),
+        torch.tensor([[0.7, 0.2], [0.2, 0.7]]),
+    ]
+    teacher = torch.tensor(
+        [
+            [[0.9, 0.0], [0.0, 0.9]],
+            [[0.6, 0.3], [0.3, 0.6]],
+            [[0.4, 0.5], [0.5, 0.4]],
+        ],
+        dtype=torch.float32,
+    )
+    captured = {}
+
+    def _fake_compute_cf_l1oo_rewards(gen, gt, *, teacher_embedding, **kwargs):
+        del gt, kwargs
+        captured["teacher_embedding"] = teacher_embedding.detach().clone()
+        return torch.ones(gen.shape[:-1], dtype=gen.dtype, device=gen.device)
+
+    monkeypatch.setattr(g1_fast_module, "compute_cf_l1oo_rewards", _fake_compute_cf_l1oo_rewards)
+
+    token_advantages, scalar_rewards = compute_g1_token_advantages_from_embeddings(
+        args,
+        gen_embeddings,
+        gt_embeddings,
+        [2, 2],
+        teacher_gen_embeddings=[teacher, teacher.clone()],
+    )
+
+    torch.testing.assert_close(captured["teacher_embedding"], teacher.unsqueeze(0).unsqueeze(0))
+    assert tuple(captured["teacher_embedding"].shape) == (1, 1, 3, 2, 2)
+    assert len(token_advantages) == 2
+    assert all(tuple(adv.shape) == (2,) for adv in token_advantages)
+    assert all(torch.isfinite(adv).all() for adv in token_advantages)
+    assert all(isinstance(value, float) for value in scalar_rewards)
+
+
+def test_g2_teacher_cache_key_includes_system_prompt_text():
+    base = dict(
+        prompt="question",
+        model_name="teacher",
+        n_samples=2,
+        temperature=0.7,
+        top_p=0.95,
+        max_new_tokens=16,
+        api_style="completions",
+        system_prompt_id="same-id",
+    )
+
+    key_a = G2TeacherCache._make_key(**base, system_prompt_text="be terse")
+    key_b = G2TeacherCache._make_key(**base, system_prompt_text="show reasoning")
+
+    assert key_a != key_b
+
+
+def test_g2_sglang_generate_teacher_requests_multi_sample_once(monkeypatch):
+    requests = []
+
+    class _Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def _fake_urlopen(request, timeout):
+        del timeout
+        requests.append(request)
+        payload = json.loads(request.data.decode("utf-8"))
+        n_samples = int(payload["sampling_params"]["n"])
+        return _Response({"text": [f"completion-{idx}" for idx in range(1, n_samples + 1)]})
+
+    monkeypatch.setattr("slime.rollout.g2_teacher.urllib.request.urlopen", _fake_urlopen)
+    client = G2RemoteTeacherClient(
+        G2RemoteTeacherConfig(
+            api_bases=("http://teacher:30000",),
+            model_name="unused-for-sglang",
+            api_style="sglang_generate",
+            temperature=0.3,
+            top_p=0.8,
+            max_new_tokens=7,
+            system_prompt_text="system",
+            remote_batch_size=1,
+        )
+    )
+    assert client._request_url("http://teacher:30000/generate") == "http://teacher:30000/generate"
+
+    completions = client.sample_targets(["prompt"], 3)
+
+    assert completions == [["completion-1", "completion-2", "completion-3"]]
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.full_url == "http://teacher:30000/generate"
+    payload = json.loads(request.data.decode("utf-8"))
+    assert payload == {
+        "text": "system\nprompt",
+        "sampling_params": {
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "max_new_tokens": 7,
+            "n": 3,
+            "skip_special_tokens": True,
+        },
+        "return_logprob": False,
+    }
+    assert client.last_stats[0]["num_requests"] == 1
+
+
+def test_g2_attach_teacher_completions_shares_group_outputs(monkeypatch):
+    class _Client:
+        def sample_targets(self, prompts, n_samples):
+            assert prompts == ["ab"]
+            assert n_samples == 2
+            return [["xy", "yx"]]
+
+    monkeypatch.setattr("slime.rollout.g2_teacher._get_client", lambda config: _Client())
+    args = Namespace(
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="teacher",
+        teacher_backend="remote",
+        teacher_api_base="http://teacher/v1",
+        teacher_model_name="teacher",
+        teacher_api_key="EMPTY",
+        teacher_api_style="completions",
+        teacher_timeout=1,
+        teacher_max_retries=1,
+        teacher_temperature=0.7,
+        teacher_top_p=0.95,
+        teacher_max_new_tokens=16,
+        teacher_system_prompt_text="",
+        teacher_system_prompt_id="",
+        teacher_cache_enable=False,
+        cf_teacher_n_samples=2,
+    )
+    group = [Sample(index=0, prompt="ab"), Sample(index=1, prompt="ab")]
+
+    attach_g2_teacher_completions(args, group)
+
+    assert group[0].metadata["g2_teacher_completions"] == ["xy", "yx"]
+    assert group[1].metadata["g2_teacher_completions"] == ["xy", "yx"]
+    assert group[0].metadata["g2_teacher_completions"] is group[1].metadata["g2_teacher_completions"]
+
+
+def test_g2_remote_teacher_config_is_hashable_for_client_cache():
+    config = G2RemoteTeacherConfig(api_bases=("http://teacher/v1",), model_name="teacher")
+
+    assert isinstance(hash(config), int)

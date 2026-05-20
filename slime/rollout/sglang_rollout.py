@@ -29,6 +29,7 @@ from slime.utils.processing_utils import (
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_function, trace_span
 from slime.utils.types import Sample
 
+from .g2_teacher import attach_g2_teacher_completions
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout", "get_model_url"]
@@ -317,6 +318,12 @@ async def generate_and_rm_group(
             rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
+
+    # Attach G2 teacher completions on the same generated/RM-scored samples.
+    # Reward post-processing later may independently add OPD teacher_log_probs.
+    if not state.aborted and not evaluation:
+        with trace_span(group, "g2_remote_teacher"):
+            group = attach_g2_teacher_completions(args, group)
 
     return group
 

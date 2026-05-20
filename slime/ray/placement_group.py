@@ -147,10 +147,15 @@ def create_training_models(args, pgs, rollout_manager):
     else:
         critic_model = None
 
+    is_standard_g2 = (
+        getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+        and getattr(args, "cf_target_mode", None) == "teacher"
+    )
     needs_megatron_g1_ref = (
         args.advantage_estimator == "g1"
         and getattr(args, "g1_embedding_source", "rollout") == "megatron_ref"
         and getattr(args, "g1_reward_location", "rollout") == "trainer"
+        and not is_standard_g2
     )
 
     start_rollout_ids = ray.get(

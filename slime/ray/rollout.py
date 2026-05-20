@@ -743,18 +743,52 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if samples[0].metadata and "g2_teacher_gen_embedding" in samples[0].metadata:
+            missing = [
+                sample.index if sample.index is not None else idx
+                for idx, sample in enumerate(samples)
+                if not sample.metadata or "g2_teacher_gen_embedding" not in sample.metadata
+            ]
+            if missing:
+                raise ValueError(f"G2 cf_l1oo teacher mode requires g2_teacher_gen_embedding for every sample; missing={missing}")
+            train_data["g2_teacher_gen_embeddings"] = [
+                sample.metadata["g2_teacher_gen_embedding"] for sample in samples
+            ]
+
+        use_g2_trainer_teacher = (
+            getattr(self.args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+            and getattr(self.args, "cf_target_mode", None) == "teacher"
+            and getattr(self.args, "teacher_backend", None) == "remote"
+            and getattr(self.args, "g1_embedding_source", "rollout") == "megatron_ref"
+            and getattr(self.args, "g1_reward_location", "rollout") == "trainer"
+        )
+
         if (
             self.args.advantage_estimator == "g1"
             and getattr(self.args, "g1_embedding_source", "rollout") == "megatron_ref"
             and getattr(self.args, "g1_reward_location", "rollout") == "trainer"
         ):
-            from slime.rollout.g1_embedding import build_g1_full_sequence_inputs, g1_embedding_config_from_args
+            from slime.rollout.g1_embedding import (
+                build_g1_full_sequence_inputs,
+                build_g1_teacher_full_sequence_inputs,
+                g1_embedding_config_from_args,
+            )
             from slime.utils.processing_utils import load_tokenizer
 
             config = g1_embedding_config_from_args(self.args)
             tokenizer = load_tokenizer(config.tokenizer_path, trust_remote_code=True)
             full_sequences = []
             qa_masks = []
+            teacher_full_sequences = [None] * len(samples) if use_g2_trainer_teacher else None
+            teacher_qa_masks = [None] * len(samples) if use_g2_trainer_teacher else None
+            if use_g2_trainer_teacher:
+                n_samples_per_prompt = int(getattr(self.args, "n_samples_per_prompt", 1))
+                if n_samples_per_prompt <= 0:
+                    raise ValueError(f"n_samples_per_prompt must be positive, got {n_samples_per_prompt}")
+                if len(samples) % n_samples_per_prompt != 0:
+                    raise ValueError(
+                        f"G2 sample count {len(samples)} must be divisible by n_samples_per_prompt={n_samples_per_prompt}"
+                    )
             for sample in samples:
                 full_sequence, _, qa_mask = build_g1_full_sequence_inputs(
                     tokenizer=tokenizer,
@@ -763,8 +797,45 @@ class RolloutManager:
                 )
                 full_sequences.append(full_sequence.tolist())
                 qa_masks.append(qa_mask.tolist())
+            if use_g2_trainer_teacher:
+                assert teacher_full_sequences is not None
+                assert teacher_qa_masks is not None
+                n_teacher = int(getattr(self.args, "cf_teacher_n_samples", 0))
+                for group_start in range(0, len(samples), n_samples_per_prompt):
+                    group = samples[group_start : group_start + n_samples_per_prompt]
+                    first_completions = group[0].metadata.get("g2_teacher_completions") if group[0].metadata else None
+                    if first_completions is None:
+                        group_indices = [sample.index for sample in group]
+                        raise ValueError(f"G2 requires g2_teacher_completions for prompt group {group_indices}")
+                    first_completions = [str(item) for item in first_completions]
+                    if len(first_completions) != n_teacher:
+                        raise ValueError(
+                            f"G2 teacher completion count {len(first_completions)} != cf_teacher_n_samples={n_teacher}"
+                        )
+                    for sample in group[1:]:
+                        candidate = sample.metadata.get("g2_teacher_completions") if sample.metadata else None
+                        if [str(item) for item in candidate or []] != first_completions:
+                            raise ValueError(
+                                "All samples in a G2 prompt group must carry identical g2_teacher_completions; "
+                                f"group_start={group_start} sample_index={sample.index}"
+                            )
+                    group_teacher_sequences, group_teacher_masks = build_g1_teacher_full_sequence_inputs(
+                        tokenizer=tokenizer,
+                        sample=group[0],
+                        teacher_completions=first_completions,
+                        config=config,
+                    )
+                    sequence_list = group_teacher_sequences.tolist()
+                    mask_list = group_teacher_masks.tolist()
+                    for sample_offset in range(n_samples_per_prompt):
+                        idx = group_start + sample_offset
+                        teacher_full_sequences[idx] = sequence_list
+                        teacher_qa_masks[idx] = mask_list
             train_data["g1_full_sequences"] = full_sequences
             train_data["g1_qa_masks"] = qa_masks
+            if use_g2_trainer_teacher:
+                train_data["g2_teacher_full_sequences"] = teacher_full_sequences
+                train_data["g2_teacher_qa_masks"] = teacher_qa_masks
         elif self.args.advantage_estimator == "g1":
             missing = [
                 sample.index if sample.index is not None else idx
@@ -844,6 +915,9 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "g2_teacher_gen_embeddings",
+                "g2_teacher_full_sequences",
+                "g2_teacher_qa_masks",
                 "g1_token_advantages",
                 "g1_full_sequences",
                 "g1_qa_masks",

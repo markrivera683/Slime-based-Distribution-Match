@@ -375,20 +375,30 @@ def _block_diag_append_packed_mask(existing: torch.Tensor, new: torch.Tensor) ->
     return merged
 
 
-def g1_runtime_dump_writer_only() -> bool:
-    """True on the unique rank allowed to mutate ``G1_RUNTIME_DUMP_PATH``.
+def _runtime_dump_writer_only(env_name: str) -> bool:
+    """True on the unique rank allowed to mutate a runtime dump path.
 
     Writes are restricted to the last pipeline stage, tensor-model-parallel rank
     zero, and (non-context-parallel) data-parallel rank zero so DP replicas do not
     race on a shared path or append incompatible shards.
     """
-    if not os.getenv("G1_RUNTIME_DUMP_PATH"):
+    if not os.getenv(env_name):
         return False
     return bool(
         mpu.is_pipeline_last_stage()
         and mpu.get_tensor_model_parallel_rank() == 0
         and mpu.get_data_parallel_rank(with_context_parallel=False) == 0
     )
+
+
+def g1_runtime_dump_writer_only() -> bool:
+    """True on the unique rank allowed to mutate ``G1_RUNTIME_DUMP_PATH``."""
+    return _runtime_dump_writer_only("G1_RUNTIME_DUMP_PATH")
+
+
+def g2_runtime_dump_writer_only() -> bool:
+    """True on the unique rank allowed to mutate ``G2_RUNTIME_DUMP_PATH``."""
+    return _runtime_dump_writer_only("G2_RUNTIME_DUMP_PATH")
 
 
 def collect_g1_runtime_dump_writer_metadata() -> dict[str, Any]:
@@ -529,7 +539,12 @@ def get_g1_embeddings_from_hidden_states(
         _append_g1_runtime_dump(
             output_path,
             {
-                "source": "slime_megatron_ref",
+                "source": (
+                    "slime_megatron_critic"
+                    if getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+                    and getattr(args, "cf_target_mode", None) == "teacher"
+                    else "slime_megatron_ref"
+                ),
                 "dump_chunk_sample_count": chunk_samples,
                 "dump_sample_count_total": chunk_samples,
                 "g1_dump_writer_metadata": writer_meta,

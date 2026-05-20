@@ -425,6 +425,9 @@ def log_rollout_data(
                 "dynamic_global_batch_size",
                 "g1_full_sequences",
                 "g1_qa_masks",
+                "g2_teacher_gen_embeddings",
+                "g2_teacher_full_sequences",
+                "g2_teacher_qa_masks",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -630,10 +633,16 @@ def sync_actor_critic_data(
 
     - Values are broadcast from src=1.
     - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
+    - Standard G2 trainer-side rewards are broadcast from the frozen critic
+      (src=1) to the actor on the last pipeline stage.
     Updates `rollout_data` in place with the synchronized tensors.
     """
     log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
     values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
+    is_standard_g2 = (
+        getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+        and getattr(args, "cf_target_mode", None) == "teacher"
+    )
 
     # return when not the pp last stage
     if not values and not log_probs:
@@ -655,6 +664,55 @@ def sync_actor_critic_data(
             handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
             handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
 
+    synced_g1_token_advantages = None
+    synced_rewards = None
+    if is_standard_g2 and getattr(args, "advantage_estimator", None) == "g1":
+        if values:
+            device = values[0].device
+        else:
+            device = log_probs[0].device
+
+        synced_g1_token_advantages = rollout_data.get("g1_token_advantages")
+        if not synced_g1_token_advantages:
+            synced_g1_token_advantages = [
+                torch.empty(int(response_length), dtype=torch.float32, device=device)
+                for response_length in rollout_data["response_lengths"]
+            ]
+        if len(synced_g1_token_advantages) != len(rollout_data["response_lengths"]):
+            raise ValueError(
+                "Standard G2 actor/critic sync expected one g1_token_advantages tensor per sample, "
+                f"got {len(synced_g1_token_advantages)} for {len(rollout_data['response_lengths'])} samples."
+            )
+        for sample_idx, (advantage, response_length) in enumerate(
+            zip(synced_g1_token_advantages, rollout_data["response_lengths"], strict=True)
+        ):
+            if advantage.numel() != int(response_length):
+                raise ValueError(
+                    f"Standard G2 g1_token_advantages[{sample_idx}] length {advantage.numel()} "
+                    f"!= response_length {int(response_length)}"
+                )
+            handles.append(dist.broadcast(advantage, src=1, group=group, async_op=True))
+
+        rewards = rollout_data.get("rewards")
+        if rewards:
+            synced_rewards = [
+                reward.detach().reshape(1).to(device=device, dtype=torch.float32)
+                if isinstance(reward, torch.Tensor)
+                else torch.tensor([float(reward)], dtype=torch.float32, device=device)
+                for reward in rewards
+            ]
+        else:
+            synced_rewards = [
+                torch.empty(1, dtype=torch.float32, device=device) for _ in rollout_data["response_lengths"]
+            ]
+        if len(synced_rewards) != len(rollout_data["response_lengths"]):
+            raise ValueError(
+                "Standard G2 actor/critic sync expected one reward per sample, "
+                f"got {len(synced_rewards)} for {len(rollout_data['response_lengths'])} samples."
+            )
+        for reward in synced_rewards:
+            handles.append(dist.broadcast(reward, src=1, group=group, async_op=True))
+
     for handle in handles:
         handle.wait()
 
@@ -669,3 +727,7 @@ def sync_actor_critic_data(
             if v is not None
         }
     )
+    if synced_g1_token_advantages is not None:
+        rollout_data["g1_token_advantages"] = synced_g1_token_advantages
+    if synced_rewards is not None:
+        rollout_data["rewards"] = [float(reward.item()) for reward in synced_rewards]

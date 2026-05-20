@@ -30,7 +30,21 @@ export MEGATRON_REPO="${MEGATRON_REPO:-https://github.com/NVIDIA/Megatron-LM.git
 export SLIME_DIR="${SLIME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)}"
 export INSTALL_FLASHINFER="${INSTALL_FLASHINFER:-true}"
 export FLASHINFER_VERSION="${FLASHINFER_VERSION:-0.6.6}"
-export FLASH_ATTN_WHEEL="${FLASH_ATTN_WHEEL:-/mnt/data/wheels_infra/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl}"
+export WHEELS_INFRA="${WHEELS_INFRA:-/mnt/data/wheels_infra}"
+if [[ ! -d "${WHEELS_INFRA}" && -d /mnt/data/wheel_infra ]]; then
+  WHEELS_INFRA="/mnt/data/wheel_infra"
+fi
+export INSTALL_CUDA129_FROM_WHEELS_INFRA="${INSTALL_CUDA129_FROM_WHEELS_INFRA:-true}"
+export TORCH_CU129_WHEEL_DIR="${TORCH_CU129_WHEEL_DIR:-${WHEELS_INFRA}}"
+_flash_attn_cu129="${WHEELS_INFRA}/flash_attn-2.7.4+cu129torch2.9-cp312-cp312-linux_x86_64.whl"
+_flash_attn_legacy="${WHEELS_INFRA}/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl"
+if [[ -z "${FLASH_ATTN_WHEEL:-}" ]]; then
+  if [[ -f "${_flash_attn_cu129}" ]]; then
+    export FLASH_ATTN_WHEEL="${_flash_attn_cu129}"
+  else
+    export FLASH_ATTN_WHEEL="${_flash_attn_legacy}"
+  fi
+fi
 
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
@@ -43,12 +57,6 @@ if [[ ! -f "${SLIME_DIR}/train.py" ]]; then
   echo "[ERROR] local slime source not found under SLIME_DIR=${SLIME_DIR}" >&2
   exit 1
 fi
-
-if ! command -v nvcc >/dev/null 2>&1; then
-  echo "[ERROR] nvcc not found. Expected CUDA toolkit under CUDA_HOME=${CUDA_HOME}" >&2
-  exit 1
-fi
-nvcc --version
 
 if [[ "${RECREATE_VENV}" == "true" && -d "${VENV_DIR}" ]]; then
   echo "[venv] removing existing venv to avoid stale torch/cuda extension ABI mismatches: ${VENV_DIR}"
@@ -63,8 +71,21 @@ python -m ensurepip --upgrade
 python -m pip install -U pip setuptools wheel packaging cmake ninja pybind11
 
 # Match the machine's system CUDA toolkit (nvcc 12.9).
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-  --index-url https://download.pytorch.org/whl/cu129
+_torch_wheel="${TORCH_CU129_WHEEL_DIR}/torch-2.9.1+cu129-cp312-cp312-manylinux_2_28_x86_64.whl"
+_torchvision_wheel="${TORCH_CU129_WHEEL_DIR}/torchvision-0.24.1+cu129-cp312-cp312-manylinux_2_28_x86_64.whl"
+_torchaudio_wheel="${TORCH_CU129_WHEEL_DIR}/torchaudio-2.9.1+cu129-cp312-cp312-manylinux_2_28_x86_64.whl"
+if [[ -f "${_torch_wheel}" && -f "${_torchvision_wheel}" && -f "${_torchaudio_wheel}" ]]; then
+  echo "[torch] installing cu129 wheels from ${TORCH_CU129_WHEEL_DIR}"
+  pip install \
+    --find-links "${TORCH_CU129_WHEEL_DIR}" \
+    --index-url http://mirrors.cloud.aliyuncs.com/pypi/simple/ \
+    --extra-index-url https://download.pytorch.org/whl/cu129 \
+    --trusted-host mirrors.cloud.aliyuncs.com \
+    "${_torch_wheel}" "${_torchvision_wheel}" "${_torchaudio_wheel}"
+else
+  pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+    --index-url https://download.pytorch.org/whl/cu129
+fi
 pip install "numpy<2"
 pip install cuda-python==12.9.0
 
@@ -81,6 +102,78 @@ if not version.startswith("2.9.1"):
 if cuda != "12.9":
     raise SystemExit(f"[ERROR] expected torch CUDA 12.9, got {cuda}")
 PY
+}
+
+nvcc_release_version() {
+  local cuda_home="$1"
+  if [[ ! -x "${cuda_home}/bin/nvcc" ]]; then
+    return 1
+  fi
+  "${cuda_home}/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p' | head -1
+}
+
+apply_cuda_home() {
+  export CUDA_HOME="$1"
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+}
+
+# DLC images often symlink /usr/local/cuda -> CUDA 13.x while torch cu129 needs nvcc 12.9.
+resolve_cuda_home_for_torch() {
+  local torch_cuda want got candidate
+  torch_cuda="$(python - <<'PY'
+import torch
+print(torch.version.cuda or "")
+PY
+)"
+  want="${torch_cuda:-12.9}"
+
+  if [[ -n "${CUDA_HOME:-}" ]]; then
+    got="$(nvcc_release_version "${CUDA_HOME}" || true)"
+    if [[ "${got}" == "${want}" ]]; then
+      apply_cuda_home "${CUDA_HOME}"
+      echo "[cuda] using CUDA_HOME=${CUDA_HOME} (nvcc ${got}, matches torch ${want})"
+      nvcc --version
+      return 0
+    fi
+    echo "[cuda] ignoring CUDA_HOME=${CUDA_HOME} (nvcc ${got:-unknown} != torch ${want})" >&2
+  fi
+
+  for candidate in \
+    "/usr/local/cuda-${want}" \
+    "/usr/local/cuda-12.9" \
+    "/usr/local/cuda-12.4" \
+    "/usr/local/cuda"; do
+    [[ -d "${candidate}" ]] || continue
+    got="$(nvcc_release_version "${candidate}" || true)"
+    if [[ "${got}" == "${want}" ]]; then
+      apply_cuda_home "${candidate}"
+      echo "[cuda] resolved CUDA_HOME=${CUDA_HOME} for torch CUDA ${want}"
+      nvcc --version
+      return 0
+    fi
+    echo "[cuda] skip ${candidate} (nvcc ${got:-missing}, need ${want})"
+  done
+
+  echo "[ERROR] No nvcc ${want} toolkit found for extension builds (apex, flash-attn)." >&2
+  echo "        DLC: run ${SLIME_DIR}/scripts/install_cuda129_from_wheels_infra.sh (deb under ${WHEELS_INFRA})" >&2
+  echo "        or set CUDA_HOME=/usr/local/cuda-12.9 after installing cuda-compiler-12-9 and cuda-libraries-dev-12-9" >&2
+  exit 1
+}
+
+maybe_install_cuda129_from_wheels_infra() {
+  if [[ "${INSTALL_CUDA129_FROM_WHEELS_INFRA}" != "true" && "${INSTALL_CUDA129_FROM_WHEELS_INFRA}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -x /usr/local/cuda-12.9/bin/nvcc ]]; then
+    return 0
+  fi
+  local installer="${SLIME_DIR}/scripts/install_cuda129_from_wheels_infra.sh"
+  if [[ ! -f "${installer}" ]]; then
+    echo "[WARN] CUDA 12.9 installer missing: ${installer}" >&2
+    return 0
+  fi
+  bash "${installer}"
 }
 
 install_torch_fsdp_shim() {
@@ -105,6 +198,8 @@ PY
 }
 
 assert_torch_cu129
+maybe_install_cuda129_from_wheels_infra
+resolve_cuda_home_for_torch
 
 PY_SITE_PACKAGES="$(python - <<'PY'
 import site

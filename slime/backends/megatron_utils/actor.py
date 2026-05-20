@@ -35,11 +35,13 @@ from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_da
 from .g1_fast import compute_g1_token_advantages_from_embeddings
 from .initialize import init, is_megatron_main_rank
 from .loss import (
+    collect_g1_runtime_dump_writer_metadata,
     compute_advantages_and_returns,
     get_g1_embeddings_from_hidden_states,
     get_log_probs_and_entropy,
     get_values,
     g1_runtime_dump_writer_only,
+    g2_runtime_dump_writer_only,
 )
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
@@ -96,6 +98,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.save = self.args.critic_save
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
+            if getattr(self.args, "critic_lr_head", None) == 0:
+                freeze_patterns = list(self.args.freeze_params_name_list or [])
+                if "output_layer" not in freeze_patterns:
+                    freeze_patterns.append("output_layer")
+                self.args.freeze_params_name_list = freeze_patterns
 
         (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
             args, role
@@ -222,6 +229,21 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data["g1_qa_masks"] = [
                 torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["g1_qa_masks"]
             ]
+        if "g2_teacher_full_sequences" in rollout_data:
+            rollout_data["g2_teacher_full_sequences"] = [
+                torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device())
+                for t in rollout_data["g2_teacher_full_sequences"]
+            ]
+        if "g2_teacher_qa_masks" in rollout_data:
+            rollout_data["g2_teacher_qa_masks"] = [
+                torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device())
+                for t in rollout_data["g2_teacher_qa_masks"]
+            ]
+        if "g2_teacher_gen_embeddings" in rollout_data:
+            rollout_data["g2_teacher_gen_embeddings"] = [
+                torch.tensor(t, dtype=torch.float32, device=torch.cuda.current_device())
+                for t in rollout_data["g2_teacher_gen_embeddings"]
+            ]
         if "multimodal_train_inputs" in rollout_data:
             # Move multimodal training tensors to GPU in advance
             rollout_data["multimodal_train_inputs"] = [
@@ -279,6 +301,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
             ]
         return rollout_data
+
+    def _is_standard_g2(self) -> bool:
+        return (
+            getattr(self.args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+            and getattr(self.args, "cf_target_mode", None) == "teacher"
+        )
 
     def _switch_model(self, target_tag: str) -> None:
         if target_tag not in self.weights_backuper.backup_tags:
@@ -387,11 +415,12 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> None:
         if self.args.g1_embedding_source != "megatron_ref" or self.args.g1_reward_location != "trainer":
             return
+        standard_g2 = self._is_standard_g2()
         required = ["g1_full_sequences", "g1_qa_masks"]
         missing = [key for key in required if key not in rollout_data]
         if missing:
-            raise ValueError(f"Megatron G1 fast path requires rollout_data keys {missing}")
-        if "ref" not in self.weights_backuper.backup_tags:
+            raise ValueError(f"Trainer-side G1/G2 embedding path requires rollout_data keys {missing}")
+        if not standard_g2 and "ref" not in self.weights_backuper.backup_tags:
             raise ValueError("Megatron G1 fast path requires a ref checkpoint/snapshot; set --ref-load")
 
         g1_rollout_data = dict(rollout_data)
@@ -409,10 +438,14 @@ class MegatronTrainRayActor(TrainRayActor):
             g1_rollout_data["max_seq_lens"] = [max_seq_len] * len(g1_rollout_data["tokens"])
 
         dump_path = os.getenv("G1_RUNTIME_DUMP_PATH")
+        g2_dump_path = os.getenv("G2_RUNTIME_DUMP_PATH")
+        g2_dump_enabled = bool(g2_dump_path and standard_g2 and g2_runtime_dump_writer_only())
         # Single DP rank clears the dump so later appends inside the ref forward cannot
         # merge unrelated runs that happen to reuse the path.
         if dump_path and g1_runtime_dump_writer_only():
             Path(dump_path).unlink(missing_ok=True)
+        if g2_dump_enabled:
+            Path(g2_dump_path).unlink(missing_ok=True)
 
         g1_data_iterator, g1_num_microbatches = get_data_iterator(self.args, self.model, g1_rollout_data)
         try:
@@ -435,6 +468,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 embeddings["g1_gen_embedding"],
                 embeddings["g1_gt_embedding"],
                 rollout_data["response_lengths"],
+                teacher_gen_embeddings=rollout_data.get("g2_teacher_gen_embeddings"),
+                g2_runtime_dump_path=g2_dump_path if g2_dump_enabled else None,
+                g2_dump_writer_metadata=collect_g1_runtime_dump_writer_metadata() if g2_dump_enabled else None,
             )
             if dump_path and g1_runtime_dump_writer_only():
                 output_path = Path(dump_path)
@@ -450,6 +486,107 @@ class MegatronTrainRayActor(TrainRayActor):
             if not bool(getattr(self.args, "g1_use_ebft_loss", False)):
                 rollout_data.pop("g1_full_sequences", None)
                 rollout_data.pop("g1_qa_masks", None)
+            rollout_data.pop("g2_teacher_full_sequences", None)
+            rollout_data.pop("g2_teacher_qa_masks", None)
+
+    def compute_g2_teacher_gen_embeddings(self, rollout_data: RolloutBatch) -> None:
+        if getattr(self.args, "distribution_reward_type", "pointwise") != "cf_l1oo":
+            return
+        if getattr(self.args, "cf_target_mode", None) != "teacher":
+            return
+        if "g2_teacher_gen_embeddings" in rollout_data:
+            return
+
+        required = ["g2_teacher_full_sequences", "g2_teacher_qa_masks"]
+        missing = [key for key in required if key not in rollout_data]
+        if missing:
+            raise ValueError(f"Standard G2 trainer-side teacher embedding requires rollout_data keys {missing}")
+
+        n_samples_per_prompt = int(getattr(self.args, "n_samples_per_prompt", 1))
+        n_teacher = int(getattr(self.args, "cf_teacher_n_samples", 0))
+        if n_samples_per_prompt <= 0 or n_teacher <= 0:
+            raise ValueError(
+                f"Invalid G2 group sizes: n_samples_per_prompt={n_samples_per_prompt}, cf_teacher_n_samples={n_teacher}"
+            )
+        num_samples = len(rollout_data["tokens"])
+        if num_samples % n_samples_per_prompt != 0:
+            raise ValueError(
+                f"G2 local sample count {num_samples} must be divisible by n_samples_per_prompt={n_samples_per_prompt}"
+            )
+
+        teacher_sequences = []
+        teacher_qa_masks = []
+        group_first_indices = []
+        for group_start in range(0, num_samples, n_samples_per_prompt):
+            first_sequences = rollout_data["g2_teacher_full_sequences"][group_start]
+            first_masks = rollout_data["g2_teacher_qa_masks"][group_start]
+            if first_sequences.ndim != 2 or first_sequences.shape[0] != n_teacher:
+                raise ValueError(
+                    "Each G2 teacher sequence entry must have shape [M, sequence_length], "
+                    f"got {tuple(first_sequences.shape)} at group_start={group_start}"
+                )
+            if first_masks.shape != first_sequences.shape:
+                raise ValueError(
+                    f"G2 teacher qa mask shape {tuple(first_masks.shape)} must match sequences {tuple(first_sequences.shape)}"
+                )
+            for offset in range(1, n_samples_per_prompt):
+                idx = group_start + offset
+                if not torch.equal(rollout_data["g2_teacher_full_sequences"][idx], first_sequences):
+                    raise ValueError(
+                        "All samples in a G2 prompt group must share identical teacher full sequences; "
+                        f"group_start={group_start} sample_offset={offset}"
+                    )
+                if not torch.equal(rollout_data["g2_teacher_qa_masks"][idx], first_masks):
+                    raise ValueError(
+                        "All samples in a G2 prompt group must share identical teacher qa masks; "
+                        f"group_start={group_start} sample_offset={offset}"
+                    )
+            teacher_sequences.extend(first_sequences.unbind(dim=0))
+            teacher_qa_masks.extend(first_masks.unbind(dim=0))
+            group_first_indices.append(group_start)
+
+        teacher_rollout_data = dict(rollout_data)
+        teacher_rollout_data["tokens"] = teacher_sequences
+        teacher_rollout_data["g1_qa_masks"] = teacher_qa_masks
+        teacher_rollout_data["total_lengths"] = [int(t.numel()) for t in teacher_sequences]
+        teacher_rollout_data["response_lengths"] = [int(self.args.g1_response_length)] * len(teacher_sequences)
+        teacher_rollout_data["loss_masks"] = [
+            torch.ones(int(self.args.g1_response_length), dtype=torch.int, device=torch.cuda.current_device())
+            for _ in teacher_sequences
+        ]
+        if self.args.qkv_format == "bshd":
+            max_seq_len = max(t.size(0) for t in teacher_sequences)
+            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
+            teacher_rollout_data["max_seq_lens"] = [max_seq_len] * len(teacher_sequences)
+
+        teacher_data_iterator, teacher_num_microbatches = get_data_iterator(self.args, self.model, teacher_rollout_data)
+        with timer("g2_teacher_megatron_embeddings"):
+            embeddings = forward_only(
+                get_g1_embeddings_from_hidden_states,
+                self.args,
+                self.model,
+                teacher_data_iterator,
+                teacher_num_microbatches,
+                collect_hidden_states=True,
+                extra_batch_keys=["g1_qa_masks"],
+            )
+        if not embeddings:
+            return
+
+        gen_embeddings = embeddings["g1_gen_embedding"]
+        expected = len(group_first_indices) * n_teacher
+        if len(gen_embeddings) != expected:
+            raise ValueError(f"G2 teacher embedding count {len(gen_embeddings)} != expected {expected}")
+
+        teacher_by_sample = [None] * num_samples
+        cursor = 0
+        for group_start in group_first_indices:
+            group_teacher = torch.stack([gen_embeddings[cursor + i].float() for i in range(n_teacher)], dim=0)
+            cursor += n_teacher
+            for offset in range(n_samples_per_prompt):
+                teacher_by_sample[group_start + offset] = group_teacher
+        rollout_data["g2_teacher_gen_embeddings"] = teacher_by_sample
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.debug_rollout_only:
@@ -478,6 +615,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_microbatches,
             )
         )
+
+        if self._is_standard_g2() and self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
+            self.compute_g2_teacher_gen_embeddings(rollout_data)
+            self.compute_g1_token_advantages(rollout_data)
 
         if rollout_id >= self.args.num_critic_only_steps and not self.args.critic_train_only:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
@@ -529,10 +670,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 if self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
-                    if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("ref")
-                    self.compute_g1_token_advantages(rollout_data)
+                    if not self._is_standard_g2():
+                        if self.args.use_routing_replay:
+                            os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                        self._switch_model("ref")
+                        self.compute_g2_teacher_gen_embeddings(rollout_data)
+                        self.compute_g1_token_advantages(rollout_data)
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
