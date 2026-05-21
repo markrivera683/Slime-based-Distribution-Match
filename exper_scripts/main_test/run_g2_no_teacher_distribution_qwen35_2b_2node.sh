@@ -20,8 +20,9 @@ RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_WAIT_SECONDS="${RAY_WAIT_SECONDS:-600}"
 RAY_HEAD_ADDR_WAIT_SECONDS="${RAY_HEAD_ADDR_WAIT_SECONDS:-600}"
 RAY_HEAD_ADDR_DIR="${RAY_HEAD_ADDR_DIR:-/mnt/data/slime/ray_head}"
-RAY_HEAD_LOG="${RAY_HEAD_LOG:-${DLC_LOCAL_ROOT}/slime_logs/g2_no_teacher_distribution_ray_head.log}"
-RAY_WORKER_LOG="${RAY_WORKER_LOG:-${DLC_LOCAL_ROOT}/slime_logs/g2_no_teacher_distribution_ray_worker.log}"
+RAY_LOG_DIR="${RAY_LOG_DIR:-/tmp/slime_logs}"
+RAY_HEAD_LOG="${RAY_HEAD_LOG:-${RAY_LOG_DIR}/g2_no_teacher_distribution_ray_head.log}"
+RAY_WORKER_LOG="${RAY_WORKER_LOG:-${RAY_LOG_DIR}/g2_no_teacher_distribution_ray_worker.log}"
 
 TEACHER_NODE_RANK="${TEACHER_NODE_RANK:-0}"
 STUDENT_NODE_RANK="${STUDENT_NODE_RANK:-1}"
@@ -41,7 +42,7 @@ setup_dlc_runtime_env() {
   export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
   [[ "${NCCL_P2P_DISABLE:-}" == "1" ]] && unset NCCL_P2P_DISABLE
   export NCCL_NET_GDR_DISABLE="${NCCL_NET_GDR_DISABLE:-1}"
-  mkdir -p "${DLC_LOCAL_ROOT}/slime_logs" "${TORCH_EXTENSIONS_DIR}" "${TRITON_CACHE_DIR}" "${RAY_TMPDIR}"
+  mkdir -p "${DLC_LOCAL_ROOT}/slime_logs" "${RAY_LOG_DIR}" "${TORCH_EXTENSIONS_DIR}" "${TRITON_CACHE_DIR}" "${RAY_TMPDIR}"
 }
 
 setup_dlc_stable_run_name() {

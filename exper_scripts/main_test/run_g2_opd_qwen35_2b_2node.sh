@@ -60,7 +60,9 @@ setup_dlc_runtime_env() {
   export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${DLC_LOCAL_ROOT}/.torch_extensions}"
   export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${DLC_LOCAL_ROOT}/.triton_cache}"
-  export RAY_TMPDIR="${RAY_TMPDIR:-${DLC_LOCAL_ROOT}/ray_slime_g2_opd}"
+  # Ray appends session and socket paths under this directory; keep it short to
+  # stay below Linux's 107-byte AF_UNIX socket path limit.
+  export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_g2_opd}"
   export TEACHER_CACHE_DIR="${TEACHER_CACHE_DIR:-${DLC_LOCAL_ROOT}/teacher_cache_shared}"
   export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
   [[ "${NCCL_P2P_DISABLE:-}" == "1" ]] && unset NCCL_P2P_DISABLE
