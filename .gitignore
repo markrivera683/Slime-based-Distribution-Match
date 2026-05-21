@@ -180,6 +180,7 @@ settings.json
 wandb/
 outputs/
 local/
+refactor_debugging/dlc_logs/
 **/rollout_data/
 **/buffer_stats/
 *.out
