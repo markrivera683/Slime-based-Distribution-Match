@@ -127,13 +127,11 @@ maybe_build_slime_env() {
     echo "[ERROR] BUILD_SLIME_ENV requested but BUILD_SCRIPT missing: ${BUILD_SCRIPT}" >&2
     exit 1
   fi
-  if [[ "${DLC_NODE_RANK}" == "${TEACHER_NODE_RANK}" ]]; then
-    maybe_install_cuda129_for_dlc_build
-    echo "[dlc] rank=${DLC_NODE_RANK} building Slime env via ${BUILD_SCRIPT}"
-    bash "${BUILD_SCRIPT}"
-  else
-    wait_for_slime_env
-  fi
+  # /root is pod-local in DLC, so each pod must build its own local venv.
+  # Waiting for rank 0's /root/slime_runtime/slime_env.sh would deadlock rank 1.
+  maybe_install_cuda129_for_dlc_build
+  echo "[dlc] rank=${DLC_NODE_RANK} building local Slime env via ${BUILD_SCRIPT}"
+  bash "${BUILD_SCRIPT}"
 }
 
 source_slime_env() {
@@ -173,6 +171,14 @@ resolve_host_ip() {
 }
 
 get_local_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    local eth0_ip
+    eth0_ip="$(ip -o -4 addr show dev eth0 scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}')"
+    if [[ -n "${eth0_ip}" ]]; then
+      echo "${eth0_ip}"
+      return 0
+    fi
+  fi
   hostname -I 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^127\./ && $i !~ /:/) {print $i; exit}}'
 }
 

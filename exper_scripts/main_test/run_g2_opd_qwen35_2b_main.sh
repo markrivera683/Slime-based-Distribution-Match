@@ -215,6 +215,7 @@ SAVE_HF_PATH_TEMPLATE="${SAVE_HF_PATH_TEMPLATE:-${OUTPUT_ROOT}/${RUN_NAME}/hf/ro
 ARTIFACT_DIR="${ARTIFACT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}/artifacts}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_g2_opd_main_${USER:-user}}"
+DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-log_unexpected}"
 RAY_ADDRESS="http://${RAY_NODE_IP_ADDRESS}:${RAY_DASHBOARD_PORT}"
 DRIVER_LOG="${ARTIFACT_DIR}/ray_job_driver.log"
 POST_EVAL_LOG="${ARTIFACT_DIR}/post_eval.log"
@@ -555,6 +556,7 @@ CMD=(
   --save "${SAVE_PATH}"
   --critic-save "${CRITIC_SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL}"
+  --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS}"
   --prompt-data "${SLIME_TRAIN_DATA}"
   --input-key prompt
   --label-key label
@@ -678,9 +680,15 @@ if [[ "${ENABLE_SLIME_EVAL}" == "true" ]]; then
   )
 fi
 
-printf "%q " "${CMD[@]}" >"${ARTIFACT_DIR}/argv.sh"
-printf "\n" >>"${ARTIFACT_DIR}/argv.sh"
-cat >"${ARTIFACT_DIR}/run_context.env" <<EOF
+write_argv_artifact() {
+  {
+    printf "%q " "${CMD[@]}"
+    printf "\n"
+  } >"${ARTIFACT_DIR}/argv.sh"
+}
+
+write_run_context_artifact() {
+  cat >"${ARTIFACT_DIR}/run_context.env" <<EOF
 RUN_NAME=${RUN_NAME}
 DEPLOY_LAYOUT=${DEPLOY_LAYOUT}
 DEPLOY_ROLE=${DEPLOY_ROLE}
@@ -694,6 +702,7 @@ SAVE_PATH=${SAVE_PATH}
 CRITIC_SAVE_PATH=${CRITIC_SAVE_PATH}
 SAVE_HF_PATH_TEMPLATE=${SAVE_HF_PATH_TEMPLATE}
 ARTIFACT_DIR=${ARTIFACT_DIR}
+DIST_CKPT_STRICTNESS=${DIST_CKPT_STRICTNESS}
 SLIME_ROOT=${SLIME_ROOT}
 EBFT_DEPS_ROOT=${EBFT_DEPS_ROOT}
 MEGATRON_PATH=${MEGATRON_PATH}
@@ -806,8 +815,15 @@ MBPP_EVAL_CONFIG=${MBPP_EVAL_CONFIG}
 MBPP_EVAL_SPLIT=${MBPP_EVAL_SPLIT}
 HUMANEVAL_EVAL_SPLIT=${HUMANEVAL_EVAL_SPLIT}
 EOF
+}
 
-cp "${ARTIFACT_DIR}/run_context.env" "${ARTIFACT_DIR}/hyperparams.env"
+write_argv_artifact || echo "[WARN] failed to write ${ARTIFACT_DIR}/argv.sh; continuing without argv artifact" >&2
+if write_run_context_artifact; then
+  cp "${ARTIFACT_DIR}/run_context.env" "${ARTIFACT_DIR}/hyperparams.env" || \
+    echo "[WARN] failed to copy ${ARTIFACT_DIR}/hyperparams.env; continuing without hyperparams artifact" >&2
+else
+  echo "[WARN] failed to write ${ARTIFACT_DIR}/run_context.env; continuing without run context artifact" >&2
+fi
 
 echo "[main-test] G2 + OPD Slime/Megatron run"
 echo "[main-test] DEPLOY_LAYOUT=${DEPLOY_LAYOUT} DEPLOY_ROLE=${DEPLOY_ROLE} RAY_ADDRESS=${RAY_ADDRESS}"

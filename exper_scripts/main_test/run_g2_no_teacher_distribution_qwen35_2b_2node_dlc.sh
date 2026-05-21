@@ -10,6 +10,7 @@
 #
 # Reward: G2 cf_l1oo with cf-target-mode=single, cf-teacher-lambda=0.
 # No teacher service, no teacher cache, no OPD.
+# /root is pod-local in DLC, so BUILD_SLIME_ENV builds a local venv on each pod.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -171,6 +171,14 @@ resolve_host_ip() {
 }
 
 get_local_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    local eth0_ip
+    eth0_ip="$(ip -o -4 addr show dev eth0 scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}')"
+    if [[ -n "${eth0_ip}" ]]; then
+      echo "${eth0_ip}"
+      return 0
+    fi
+  fi
   hostname -I 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^127\./ && $i !~ /:/) {print $i; exit}}'
 }
 

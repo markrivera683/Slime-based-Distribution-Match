@@ -18,6 +18,8 @@ DLC_LOCAL_ROOT="${DLC_LOCAL_ROOT:-/mnt/workspace}"
 RAY_PORT="${RAY_PORT:-6379}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_WAIT_SECONDS="${RAY_WAIT_SECONDS:-600}"
+RAY_HEAD_ADDR_WAIT_SECONDS="${RAY_HEAD_ADDR_WAIT_SECONDS:-600}"
+RAY_HEAD_ADDR_DIR="${RAY_HEAD_ADDR_DIR:-/mnt/data/slime/ray_head}"
 RAY_HEAD_LOG="${RAY_HEAD_LOG:-${DLC_LOCAL_ROOT}/slime_logs/g2_no_teacher_distribution_ray_head.log}"
 RAY_WORKER_LOG="${RAY_WORKER_LOG:-${DLC_LOCAL_ROOT}/slime_logs/g2_no_teacher_distribution_ray_worker.log}"
 
@@ -45,7 +47,7 @@ setup_dlc_stable_run_name() {
     return 0
   fi
   local job_id
-  job_id="$(hostname | sed -E 's/^(dlc[a-z0-9]+)-(master|worker)-[0-9]+$//' || true)"
+  job_id="$(hostname | sed -E 's/^(dlc[a-z0-9]+)-(master|worker)-[0-9]+$/\1/' || true)"
   if [[ -n "${job_id}" && "${job_id}" != "$(hostname)" ]]; then
     export RUN_NAME="g2_no_teacher_distribution_${job_id}"
   fi
@@ -61,7 +63,7 @@ need_slime_build() {
 
 wait_for_slime_env() {
   local waited=0
-  echo "[dlc] rank=${DLC_NODE_RANK:-?} waiting for ${SLIME_ENV_FILE}"
+  echo "[dlc] rank=${DLC_NODE_RANK:-?} waiting for ${SLIME_ENV_FILE} (timeout ${SLIME_ENV_WAIT_SECONDS}s)"
   while [[ ! -f "${SLIME_ENV_FILE}" || ! -x "${PYTHON_BIN}" ]]; do
     sleep 10
     waited=$((waited + 10))
@@ -70,6 +72,22 @@ wait_for_slime_env() {
       exit 1
     fi
   done
+  echo "[dlc] Slime env ready after ${waited}s"
+}
+
+maybe_install_cuda129_for_dlc_build() {
+  if [[ "${DLC_MODE}" != "true" ]]; then
+    return 0
+  fi
+  if [[ "${INSTALL_CUDA129_FROM_WHEELS_INFRA:-true}" != "true" && "${INSTALL_CUDA129_FROM_WHEELS_INFRA:-true}" != "1" ]]; then
+    return 0
+  fi
+  local installer="${SLIME_ROOT}/scripts/install_cuda129_from_wheels_infra.sh"
+  if [[ -x /usr/local/cuda-12.9/bin/nvcc || ! -f "${installer}" ]]; then
+    return 0
+  fi
+  echo "[dlc] installing CUDA 12.9 toolkit from wheels_infra before env build"
+  bash "${installer}"
 }
 
 maybe_build_slime_env() {
@@ -79,12 +97,15 @@ maybe_build_slime_env() {
   if ! need_slime_build; then
     return 0
   fi
-  if [[ "${DLC_NODE_RANK}" == "${TEACHER_NODE_RANK}" ]]; then
-    echo "[dlc] rank=${DLC_NODE_RANK} building Slime env via ${BUILD_SCRIPT}"
-    bash "${BUILD_SCRIPT}"
-  else
-    wait_for_slime_env
+  if [[ ! -f "${BUILD_SCRIPT}" ]]; then
+    echo "[ERROR] BUILD_SLIME_ENV requested but BUILD_SCRIPT missing: ${BUILD_SCRIPT}" >&2
+    exit 1
   fi
+  # /root is pod-local in DLC, so each pod must build its own local venv.
+  # Waiting for rank 0's /root/slime_runtime/slime_env.sh would deadlock rank 1.
+  maybe_install_cuda129_for_dlc_build
+  echo "[dlc] rank=${DLC_NODE_RANK} building local Slime env via ${BUILD_SCRIPT}"
+  bash "${BUILD_SCRIPT}"
 }
 
 source_slime_env() {
@@ -106,6 +127,100 @@ resolve_host_ip() {
     return 0
   fi
   getent ahostsv4 "${host}" | awk 'NR==1 {print $1}'
+}
+
+get_local_ip() {
+  local preferred_peer="${1:-}"
+  local ip_from_hostname
+  ip_from_hostname="$(
+    hostname -I 2>/dev/null | awk -v peer="${preferred_peer}" '
+      function prefix3(ip, parts) {
+        split(ip, parts, ".")
+        return parts[1] "." parts[2] "." parts[3] "."
+      }
+      BEGIN {
+        peer_prefix = peer ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ ? prefix3(peer) : ""
+      }
+      {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^127\./ || $i ~ /:/) {
+            continue
+          }
+          if (first == "") {
+            first = $i
+          }
+          if (peer_prefix != "" && index($i, peer_prefix) == 1) {
+            print $i
+            printed = 1
+            exit
+          }
+        }
+      }
+      END {
+        if (!printed && first != "") {
+          print first
+        }
+      }'
+  )"
+  if [[ -n "${ip_from_hostname}" && "${preferred_peer}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local preferred_prefix="${preferred_peer%.*}."
+    if [[ "${ip_from_hostname}" == "${preferred_prefix}"* ]]; then
+      echo "${ip_from_hostname}"
+      return 0
+    fi
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    local eth0_ip
+    eth0_ip="$(ip -o -4 addr show dev eth0 scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}')"
+    if [[ -n "${eth0_ip}" ]]; then
+      echo "${eth0_ip}"
+      return 0
+    fi
+  fi
+  echo "${ip_from_hostname}"
+}
+
+ray_head_addr_file() {
+  if [[ -n "${RAY_HEAD_ADDR_FILE:-}" ]]; then
+    echo "${RAY_HEAD_ADDR_FILE}"
+    return 0
+  fi
+  local generation="${JOB_FAILOVER_GENERATION:-0}"
+  echo "${RAY_HEAD_ADDR_DIR}/${RUN_NAME:-g2_no_teacher_distribution}_${generation}.addr"
+}
+
+publish_ray_head_addr() {
+  local head_ip="$1"
+  local addr_file
+  addr_file="$(ray_head_addr_file)"
+  mkdir -p "$(dirname "${addr_file}")"
+  printf "%s\n" "${head_ip}" >"${addr_file}.tmp"
+  mv -f "${addr_file}.tmp" "${addr_file}"
+  echo "[orchestrator] published Ray head address ${head_ip} to ${addr_file}"
+}
+
+wait_for_published_ray_head_addr() {
+  local fallback_ip="$1"
+  local addr_file waited head_ip
+  addr_file="$(ray_head_addr_file)"
+  waited=0
+  echo "[orchestrator] waiting for Ray head address file ${addr_file}"
+  while [[ ! -s "${addr_file}" ]]; do
+    sleep 5
+    waited=$((waited + 5))
+    if (( waited >= RAY_HEAD_ADDR_WAIT_SECONDS )); then
+      echo "[WARN] Ray head address file not ready after ${RAY_HEAD_ADDR_WAIT_SECONDS}s; falling back to ${fallback_ip}" >&2
+      echo "${fallback_ip}"
+      return 0
+    fi
+  done
+  head_ip="$(awk 'NF {print $1; exit}' "${addr_file}")"
+  if [[ -z "${head_ip}" ]]; then
+    echo "[WARN] Ray head address file ${addr_file} is empty; falling back to ${fallback_ip}" >&2
+    echo "${fallback_ip}"
+    return 0
+  fi
+  echo "${head_ip}"
 }
 
 detect_dlc_mode() {
@@ -138,21 +253,24 @@ wait_ray_head() {
 }
 
 start_ray_head_and_submit() {
-  local head_ip="$1"
+  local head_connect_ip="$1"
+  local head_bind_ip="$2"
+  shift 2
   rm -f "${RAY_HEAD_LOG}" 2>/dev/null || true
   "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
-  echo "[orchestrator] starting Ray head ${head_ip}:${RAY_PORT}; log=${RAY_HEAD_LOG}"
-  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"   "${RAY_BIN}" start --head     --node-ip-address "${head_ip}"     --port "${RAY_PORT}"     --dashboard-host=0.0.0.0     --dashboard-port "${RAY_DASHBOARD_PORT}"     --num-gpus 8     --temp-dir "${RAY_TMPDIR}"     --block >"${RAY_HEAD_LOG}" 2>&1 &
+  echo "[orchestrator] starting Ray head bind=${head_bind_ip}:${RAY_PORT} connect=${head_connect_ip}:${RAY_PORT}; log=${RAY_HEAD_LOG}"
+  publish_ray_head_addr "${head_bind_ip}"
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"   "${RAY_BIN}" start --head     --node-ip-address "${head_bind_ip}"     --port "${RAY_PORT}"     --dashboard-host=0.0.0.0     --dashboard-port "${RAY_DASHBOARD_PORT}"     --num-gpus 8     --temp-dir "${RAY_TMPDIR}"     --block >"${RAY_HEAD_LOG}" 2>&1 &
   local ray_pid=$!
   trap 'kill ${ray_pid} 2>/dev/null || true; "${RAY_BIN}" stop --force >/dev/null 2>&1 || true' EXIT INT TERM
-  wait_ray_head "${head_ip}:${RAY_PORT}"
+  wait_ray_head "${head_bind_ip}:${RAY_PORT}"
   sleep "${WORKER_JOIN_GRACE_SECONDS:-20}"
 
   export DEPLOY_LAYOUT=two_node
   export DEPLOY_ROLE=trainer
   export USE_EXISTING_RAY=true
-  export RAY_NODE_IP_ADDRESS="${head_ip}"
-  export RAY_ADDRESS="http://${head_ip}:${RAY_DASHBOARD_PORT}"
+  export RAY_NODE_IP_ADDRESS="${head_bind_ip}"
+  export RAY_ADDRESS="http://${head_bind_ip}:${RAY_DASHBOARD_PORT}"
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
   export G2_OPD_MODE="${G2_OPD_MODE:-cf_l1oo_no_teacher_distribution}"
   export CF_TARGET_MODE="${CF_TARGET_MODE:-single}"
@@ -199,12 +317,26 @@ if [[ "${DLC_WORLD_SIZE}" != "2" ]]; then
   exit 1
 fi
 
-head_ip="$(resolve_host_ip "${DLC_MASTER_ADDR}")"
-echo "[orchestrator] G2 no-teacher distribution DLC rank=${DLC_NODE_RANK} head=${head_ip} world=${DLC_WORLD_SIZE} RUN_NAME=${RUN_NAME:-auto}"
+head_connect_ip="$(resolve_host_ip "${DLC_MASTER_ADDR}")"
+if [[ -z "${head_connect_ip}" ]]; then
+  echo "[ERROR] failed to resolve DLC master address: ${DLC_MASTER_ADDR}" >&2
+  exit 1
+fi
+head_bind_ip="${RAY_HEAD_NODE_IP:-}"
+if [[ "${DLC_NODE_RANK}" == "${TEACHER_NODE_RANK}" && -z "${head_bind_ip}" ]]; then
+  head_bind_ip="$(get_local_ip "${head_connect_ip}")"
+fi
+if [[ "${DLC_NODE_RANK}" == "${TEACHER_NODE_RANK}" && -z "${head_bind_ip}" ]]; then
+  echo "[ERROR] failed to determine local Ray head bind IP" >&2
+  exit 1
+fi
+echo "[orchestrator] G2 no-teacher distribution DLC rank=${DLC_NODE_RANK} head_connect=${head_connect_ip} head_bind=${head_bind_ip:-n/a} world=${DLC_WORLD_SIZE} RUN_NAME=${RUN_NAME:-auto}"
 if [[ "${DLC_NODE_RANK}" == "${TEACHER_NODE_RANK}" ]]; then
-  start_ray_head_and_submit "${head_ip}" "$@"
+  start_ray_head_and_submit "${head_connect_ip}" "${head_bind_ip}" "$@"
 elif [[ "${DLC_NODE_RANK}" == "${STUDENT_NODE_RANK}" ]]; then
-  start_ray_worker_blocking "${head_ip}"
+  head_join_ip="$(wait_for_published_ray_head_addr "${head_connect_ip}")"
+  echo "[orchestrator] worker will join Ray head ${head_join_ip}:${RAY_PORT}"
+  start_ray_worker_blocking "${head_join_ip}"
 else
   echo "[ERROR] unexpected DLC_NODE_RANK=${DLC_NODE_RANK}" >&2
   exit 1

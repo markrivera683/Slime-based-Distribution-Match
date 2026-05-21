@@ -472,9 +472,15 @@ if [[ "${ENABLE_SLIME_EVAL}" == "true" ]]; then
   )
 fi
 
-printf "%q " "${CMD[@]}" >"${ARTIFACT_DIR}/argv.sh"
-printf "\n" >>"${ARTIFACT_DIR}/argv.sh"
-cat >"${ARTIFACT_DIR}/run_context.env" <<EOF
+write_argv_artifact() {
+  {
+    printf "%q " "${CMD[@]}"
+    printf "\n"
+  } >"${ARTIFACT_DIR}/argv.sh"
+}
+
+write_run_context_artifact() {
+  cat >"${ARTIFACT_DIR}/run_context.env" <<EOF
 RUN_NAME=${RUN_NAME}
 LOAD_PATH=${LOAD_PATH}
 SAVE_PATH=${SAVE_PATH}
@@ -536,8 +542,15 @@ N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT}
 EVAL_MAX_PROMPT_LEN=${EVAL_MAX_PROMPT_LEN}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN}
 EOF
+}
 
-cp "${ARTIFACT_DIR}/run_context.env" "${ARTIFACT_DIR}/hyperparams.env"
+write_argv_artifact || echo "[WARN] failed to write ${ARTIFACT_DIR}/argv.sh; continuing without argv artifact" >&2
+if write_run_context_artifact; then
+  cp "${ARTIFACT_DIR}/run_context.env" "${ARTIFACT_DIR}/hyperparams.env" || \
+    echo "[WARN] failed to copy ${ARTIFACT_DIR}/hyperparams.env; continuing without hyperparams artifact" >&2
+else
+  echo "[WARN] failed to write ${ARTIFACT_DIR}/run_context.env; continuing without run context artifact" >&2
+fi
 
 echo "[main-test] OpenRLHF-G1 aligned Slime run"
 echo "[main-test] RUN_NAME=${RUN_NAME}"
