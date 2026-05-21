@@ -35,7 +35,9 @@ setup_dlc_runtime_env() {
   export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${DLC_LOCAL_ROOT}/.torch_extensions}"
   export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${DLC_LOCAL_ROOT}/.triton_cache}"
-  export RAY_TMPDIR="${RAY_TMPDIR:-${DLC_LOCAL_ROOT}/ray_slime_g2_no_teacher_distribution}"
+  # Ray appends session and socket paths under this directory; keep it short to
+  # stay below Linux's 107-byte AF_UNIX socket path limit.
+  export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray}"
   export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
   [[ "${NCCL_P2P_DISABLE:-}" == "1" ]] && unset NCCL_P2P_DISABLE
   export NCCL_NET_GDR_DISABLE="${NCCL_NET_GDR_DISABLE:-1}"
@@ -204,7 +206,7 @@ wait_for_published_ray_head_addr() {
   local addr_file waited head_ip
   addr_file="$(ray_head_addr_file)"
   waited=0
-  echo "[orchestrator] waiting for Ray head address file ${addr_file}"
+  echo "[orchestrator] waiting for Ray head address file ${addr_file}" >&2
   while [[ ! -s "${addr_file}" ]]; do
     sleep 5
     waited=$((waited + 5))
@@ -239,14 +241,38 @@ detect_dlc_mode() {
   fi
 }
 
+dump_log_excerpt() {
+  local label="$1"
+  local log_file="$2"
+  local lines="${3:-${DUMP_RAY_LOG_LINES:-200}}"
+  if [[ -z "${log_file}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${log_file}" ]]; then
+    echo "[WARN] ${label} log not found: ${log_file}" >&2
+    return 0
+  fi
+  echo "[orchestrator] begin ${label} log excerpt: ${log_file}" >&2
+  tail -n "${lines}" "${log_file}" >&2 || true
+  echo "[orchestrator] end ${label} log excerpt" >&2
+}
+
 wait_ray_head() {
   local address="$1"
+  local log_file="${2:-}"
+  local ray_pid="${3:-}"
   local waited=0
   until "${RAY_BIN}" status --address "${address}" >/dev/null 2>&1; do
     sleep 5
     waited=$((waited + 5))
+    if [[ -n "${ray_pid}" ]] && ! kill -0 "${ray_pid}" 2>/dev/null; then
+      echo "[ERROR] Ray process ${ray_pid} exited before head became ready at ${address}" >&2
+      dump_log_excerpt "Ray head" "${log_file}"
+      exit 1
+    fi
     if (( waited >= RAY_WAIT_SECONDS )); then
       echo "[ERROR] Ray head not ready at ${address} after ${RAY_WAIT_SECONDS}s" >&2
+      dump_log_excerpt "Ray head" "${log_file}"
       exit 1
     fi
   done
@@ -263,7 +289,7 @@ start_ray_head_and_submit() {
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"   "${RAY_BIN}" start --head     --node-ip-address "${head_bind_ip}"     --port "${RAY_PORT}"     --dashboard-host=0.0.0.0     --dashboard-port "${RAY_DASHBOARD_PORT}"     --num-gpus 8     --temp-dir "${RAY_TMPDIR}"     --block >"${RAY_HEAD_LOG}" 2>&1 &
   local ray_pid=$!
   trap 'kill ${ray_pid} 2>/dev/null || true; "${RAY_BIN}" stop --force >/dev/null 2>&1 || true' EXIT INT TERM
-  wait_ray_head "${head_bind_ip}:${RAY_PORT}"
+  wait_ray_head "${head_bind_ip}:${RAY_PORT}" "${RAY_HEAD_LOG}" "${ray_pid}"
   sleep "${WORKER_JOIN_GRACE_SECONDS:-20}"
 
   export DEPLOY_LAYOUT=two_node
