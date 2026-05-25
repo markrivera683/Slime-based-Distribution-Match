@@ -1008,6 +1008,52 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--use-effopd",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable EffOPD mechanism validation for the current G2 cf_l1oo + SGLang OPD workflow. "
+                    "Here G2 means cf_l1oo reward; OPD means SGLang teacher-logprob distillation."
+                ),
+            )
+            parser.add_argument("--effopd-dv-size", type=int, default=50, help="EffOPD lightweight D_v size.")
+            parser.add_argument("--effopd-dv-seed", type=int, default=42, help="EffOPD D_v sampling seed.")
+            parser.add_argument("--effopd-max-k", type=int, default=5, help="Maximum EffOPD candidate k.")
+            parser.add_argument(
+                "--effopd-max-triggers",
+                type=int,
+                default=-1,
+                help="Maximum number of EffOPD power-of-two trigger events; -1 means unlimited.",
+            )
+            parser.add_argument(
+                "--effopd-lr-decay",
+                type=float,
+                default=0.5,
+                help="Learning-rate multiplier applied after an accepted EffOPD extrapolation.",
+            )
+            parser.add_argument(
+                "--effopd-validation-mode",
+                type=str,
+                choices=["opd_kl_shadow_cf", "combined_shadow", "combined_gate"],
+                default="opd_kl_shadow_cf",
+                help=(
+                    "EffOPD validation mode. Shadow modes log G2 cf_l1oo reward and OPD KL separately; "
+                    "combined_gate applies D_v candidate scoring as the accept gate."
+                ),
+            )
+            parser.add_argument(
+                "--effopd-force-weight-sync",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Force SGLang weight sync after an EffOPD trigger so the next rollout uses the accepted actor.",
+            )
+            parser.add_argument(
+                "--effopd-state-dir",
+                type=str,
+                default="auto",
+                help="EffOPD sidecar state directory. 'auto' stores sidecars under {save}/effopd.",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1884,6 +1930,28 @@ def slime_validate_args(args):
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+
+    if getattr(args, "use_effopd", False):
+        if not getattr(args, "use_opd", False) or getattr(args, "opd_type", None) != "sglang":
+            raise ValueError("EffOPD currently targets SGLang OPD; set --use-opd --opd-type sglang.")
+        if getattr(args, "distribution_reward_type", "pointwise") != "cf_l1oo":
+            raise ValueError("EffOPD currently targets G2 cf_l1oo reward; set --distribution-reward-type cf_l1oo.")
+        if getattr(args, "cf_target_mode", None) != "teacher":
+            raise ValueError("EffOPD currently targets G2 teacher mode; set --cf-target-mode teacher.")
+        if getattr(args, "colocate", False):
+            raise ValueError("EffOPD mechanism validation currently supports non-colocate G2+OPD runs only.")
+        if not getattr(args, "enable_weights_backuper", True):
+            raise ValueError("EffOPD requires weights backuper; remove --disable-weights-backuper.")
+        if int(getattr(args, "effopd_dv_size", 50)) <= 0:
+            raise ValueError("--effopd-dv-size must be positive.")
+        if float(getattr(args, "effopd_lr_decay", 0.5)) <= 0.0:
+            raise ValueError("--effopd-lr-decay must be positive.")
+        if int(getattr(args, "effopd_max_k", 5)) < 1:
+            raise ValueError("--effopd-max-k must be >= 1.")
+        logger.info(
+            "EffOPD enabled for G2 cf_l1oo + SGLang OPD. Terminology: G2=cf_l1oo reward, "
+            "OPD=teacher-logprob distillation, G2+OPD=current combined workflow."
+        )
 
     if args.megatron_to_hf_mode == "bridge":
         if (

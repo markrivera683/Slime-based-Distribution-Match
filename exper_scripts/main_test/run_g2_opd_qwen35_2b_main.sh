@@ -145,6 +145,14 @@ TEACHER_CACHE_DIR="${TEACHER_CACHE_DIR:-/mnt/workspace/teacher_cache_shared}"
 
 OPD_KL_COEF="${OPD_KL_COEF:-1.0}"
 OPD_TEACHER_RM_URL="${OPD_TEACHER_RM_URL:-${TEACHER_API_BASE%/}/generate}"
+ENABLE_EFFOPD="${ENABLE_EFFOPD:-false}"
+EFFOPD_DV_SIZE="${EFFOPD_DV_SIZE:-32}"
+EFFOPD_DV_SEED="${EFFOPD_DV_SEED:-42}"
+EFFOPD_MAX_K="${EFFOPD_MAX_K:-5}"
+EFFOPD_LR_DECAY="${EFFOPD_LR_DECAY:-0.5}"
+EFFOPD_VALIDATION_MODE="${EFFOPD_VALIDATION_MODE:-opd_kl_shadow_cf}"
+EFFOPD_MAX_TRIGGERS="${EFFOPD_MAX_TRIGGERS:--1}"
+EFFOPD_FORCE_WEIGHT_SYNC="${EFFOPD_FORCE_WEIGHT_SYNC:-true}"
 
 # ---------------------------------------------------------------------------
 # 7. G1 embedding/reward path used by G2
@@ -668,6 +676,20 @@ else
 fi
 if [[ "${G1_APPLY_DENSE_ATTENTION_MASK}" == "true" ]]; then
   CMD+=(--g1-megatron-ref-apply-dense-attention-mask)
+fi
+if [[ "${ENABLE_EFFOPD}" == "true" ]]; then
+  CMD+=(
+    --use-effopd
+    --effopd-dv-size "${EFFOPD_DV_SIZE}"
+    --effopd-dv-seed "${EFFOPD_DV_SEED}"
+    --effopd-max-k "${EFFOPD_MAX_K}"
+    --effopd-lr-decay "${EFFOPD_LR_DECAY}"
+    --effopd-validation-mode "${EFFOPD_VALIDATION_MODE}"
+    --effopd-max-triggers "${EFFOPD_MAX_TRIGGERS}"
+  )
+  if [[ "${EFFOPD_FORCE_WEIGHT_SYNC}" == "false" ]]; then
+    CMD+=(--no-effopd-force-weight-sync)
+  fi
 fi
 if [[ "${ENABLE_SLIME_EVAL}" == "true" ]]; then
   CMD+=(
