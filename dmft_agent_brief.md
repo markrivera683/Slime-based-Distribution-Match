@@ -123,6 +123,59 @@ G2: distribution reward + richer target distribution + frozen feature
 G3: distribution reward + teacher target + adaptive feature geometry
 ```
 
+### 2.1 当前优先修正：OPD 是主信号，cf-l1oo 用来改进 OPD credit assignment
+
+最新判断中，项目主线不应被理解成“student distribution 去匹配 teacher 自生成 completion distribution”的黑盒蒸馏。更稳妥的主信号是 **OPD**：
+
+```text
+student on-policy rollouts
++ teacher 对这些 student rollouts 打 token logprob
++ reverse-KL / distillation loss
+```
+
+也就是说，teacher 的核心作用不是先生成一批 target completions 给 student 模仿，而是对 student 当前实际采样出的回答给出 dense supervision。
+
+当前 `cf_l1oo` 的价值仍然很大，但它应该优先用于改进 OPD 的 group-level credit assignment：
+
+```text
+同一个 prompt 下采样 N 个 student rollouts
+teacher 给每个 rollout 的 token logprob / sequence score / reverse-KL
+在这 N 个 on-policy samples 内构造 teacher-preferred target weights
+用 CF discrepancy + leave-one-out attribution 给每个 rollout 分配 advantage
+```
+
+这样得到的是 **OPD-CF-L1OO**：
+
+- support 仍然来自 student on-policy rollouts；
+- teacher 只评价这些 rollouts，不需要 teacher completion target；
+- `cf_l1oo` 不再把 teacher completions 当主 target distribution；
+- LOO reward 衡量“去掉某个 student rollout 后，teacher-weighted on-policy distribution matching 是否变差”；
+- EffOPD 仍然只是后续参数轨迹加速器，不定义新的主 loss。
+
+一个可实现的目标分布写法是：对同一 prompt 的 student samples `y_1...y_N`，先提取 feature `z_j = φ_c(y_j)`，再用 teacher score 形成权重：
+
+```math
+s_j = \sum_t \log p_T(y_{j,t} \mid c, y_{j,<t})
+```
+
+```math
+q_j = \mathrm{softmax}(s_j / \tau)
+```
+
+student 当前经验分布仍是 uniform：
+
+```math
+\mu_{\theta,c} = \frac{1}{N}\sum_j \delta(z_j)
+```
+
+teacher-preferred on-policy target distribution 是 weighted empirical distribution：
+
+```math
+\nu_{T,c}^{onpolicy} = \sum_j q_j \delta(z_j)
+```
+
+然后用现有 characteristic-function discrepancy 比较 `μ_{\theta,c}` 与 `ν_{T,c}^{onpolicy}`，并用 leave-one-out 得到每个 rollout 的 reward / advantage。这个版本保留了 cf-l1oo 的分布视角，但不退化成 teacher completion matching。
+
 ---
 
 ## 3. 方法版本总览
