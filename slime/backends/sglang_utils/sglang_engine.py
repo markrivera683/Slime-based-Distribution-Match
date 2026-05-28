@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _request_without_proxy(method, url, **kwargs):
+    kwargs.setdefault("timeout", float(os.environ.get("SLIME_HTTP_REQUEST_TIMEOUT", "10")))
     with requests.Session() as session:
         session.trust_env = False
         return session.request(method, url, **kwargs)

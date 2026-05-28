@@ -37,6 +37,20 @@ __all__ = ["generate_rollout", "get_model_url"]
 logger = logging.getLogger(__name__)
 
 
+def _trim_text_for_rollout_log(text: str, *, max_chars: int = 1600) -> str:
+    for marker in ("<|im_end|>", "<|endoftext|>"):
+        marker_idx = text.find(marker)
+        if marker_idx >= 0:
+            return text[: marker_idx + len(marker)] + " ...[trimmed after stop marker]"
+    if len(text) > max_chars:
+        return text[:max_chars] + f" ...[trimmed {len(text) - max_chars} chars]"
+    return text
+
+
+def _format_sample_for_rollout_log(sample: Sample) -> str:
+    return _trim_text_for_rollout_log(str(sample.prompt) + sample.response)
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -421,7 +435,11 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    "First rollout sample: %s, label: %s, reward: %s, response_len: %s",
+                    [_format_sample_for_rollout_log(sample)],
+                    str(sample.label)[:100],
+                    sample.reward,
+                    sample.response_length,
                 )
                 do_print = False
 
@@ -442,7 +460,11 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        "Finish rollout: %s, label: %s, reward: %s, response_len: %s",
+        [_format_sample_for_rollout_log(sample)],
+        str(sample.label)[:100],
+        sample.reward,
+        sample.response_length,
     )
 
     # there are still some unfinished requests, abort them

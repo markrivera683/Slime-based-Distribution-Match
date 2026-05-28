@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import ray
+import requests
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
@@ -1082,6 +1083,10 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
     # We will not use the health check from router.
     router_args.disable_health_check = True
+    if getattr(args, "router_disable_circuit_breaker", False) or os.environ.get(
+        "SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER", "true"
+    ).lower() in {"1", "true", "yes", "on"}:
+        router_args.disable_circuit_breaker = True
 
     logger.info(f"Launch router with args: {router_args}")
 
@@ -1096,6 +1101,44 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     assert process.is_alive()
     logger.info(f"Router launched at {router_ip}:{router_port}, Prometheus port: {router_args.prometheus_port}")
     return router_ip, router_port
+
+
+def _wait_router_workers(args, router_ip: str | None, router_port: int | None, expected_workers: int) -> None:
+    if not router_ip or not router_port or expected_workers <= 0:
+        return
+
+    timeout = float(os.environ.get("SLIME_ROUTER_WORKER_WAIT_TIMEOUT", "600"))
+    interval = float(os.environ.get("SLIME_ROUTER_WORKER_WAIT_INTERVAL", "2"))
+    url = f"http://{router_ip}:{router_port}/workers"
+    deadline = time.monotonic() + timeout
+    last_error = "not checked yet"
+
+    with requests.Session() as session:
+        session.trust_env = False
+        while time.monotonic() < deadline:
+            try:
+                response = session.get(url, timeout=float(os.environ.get("SLIME_ROUTER_WORKER_REQUEST_TIMEOUT", "10")))
+                response.raise_for_status()
+                data = response.json()
+                workers = data.get("workers", data if isinstance(data, list) else [])
+                if isinstance(workers, list) and len(workers) >= expected_workers:
+                    logger.info(
+                        "Router has %s/%s registered workers at %s",
+                        len(workers),
+                        expected_workers,
+                        url,
+                    )
+                    return
+                last_error = f"workers={workers}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+
+            time.sleep(interval)
+
+    raise TimeoutError(
+        f"Timed out after {timeout:.1f}s waiting for {expected_workers} registered SGLang workers "
+        f"at {url}; last_error={last_error}"
+    )
 
 
 def _compute_rollout_offset(args) -> int:
@@ -1149,10 +1192,16 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        direct_worker_mode = getattr(args, "sglang_direct_worker_mode", False)
+        if direct_worker_mode:
+            if has_pd or model_cfg.has_encoder_disaggregation:
+                raise ValueError("--sglang-direct-worker-mode only supports a single regular SGLang worker group.")
+            router_ip, router_port = None, None
+        else:
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
         # Write back for backward compat (first model only).
-        if model_idx == 0:
+        if model_idx == 0 and not direct_worker_mode:
             args.sglang_router_ip = router_ip
             args.sglang_router_port = router_port
 
@@ -1243,6 +1292,16 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             if all_init_handles:
                 ray.get(all_init_handles)
 
+        regular_worker_urls = [
+            url
+            for group in server_groups
+            if group.worker_type == "regular"
+            for url in ray.get([engine.get_url.remote() for engine in group.engines])
+            if url is not None
+        ]
+        if not direct_worker_mode:
+            _wait_router_workers(args, router_ip, router_port, len(regular_worker_urls))
+
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,
             router_ip=router_ip,
@@ -1250,26 +1309,19 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             model_name=model_cfg.name,
             update_weights=model_cfg.update_weights,
         )
-        if getattr(args, "sglang_direct_worker_mode", False):
-            worker_urls = [
-                url
-                for group in server_groups
-                if group.worker_type == "regular"
-                for url in ray.get([engine.get_url.remote() for engine in group.engines])
-                if url is not None
-            ]
-            if len(worker_urls) != 1:
+        if direct_worker_mode:
+            if len(regular_worker_urls) != 1:
                 raise ValueError(
-                    f"--sglang-direct-worker-mode expects exactly one regular worker, got {worker_urls}"
+                    f"--sglang-direct-worker-mode expects exactly one regular worker, got {regular_worker_urls}"
                 )
-            worker_url = worker_urls[0].removeprefix("http://")
+            worker_url = regular_worker_urls[0].removeprefix("http://")
             worker_host, worker_port = worker_url.rsplit(":", 1)
             servers[model_cfg.name].router_ip = worker_host
             servers[model_cfg.name].router_port = int(worker_port)
             logger.warning(
                 "Direct SGLang worker mode is enabled; rollout requests for %s go to %s",
                 model_cfg.name,
-                worker_urls[0],
+                regular_worker_urls[0],
             )
             if model_idx == 0:
                 args.sglang_router_ip = worker_host
