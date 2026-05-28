@@ -177,6 +177,58 @@ geometry is valid and:
 g1_response_length == g1_generate_length * num_blocks
 ```
 
+## Launching A Strict G1 EBFT GT Run
+
+The production launcher default remains unchanged:
+
+```bash
+exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_main.sh
+```
+
+To opt into strict EBFT block-source indexing, use the wrapper:
+
+```bash
+exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh
+```
+
+The wrapper sets:
+
+```bash
+G1_EBFT_LOGPROB_INDEXING=strict_block_source
+```
+
+and then delegates to the same G1 EBFT GT launcher. All existing environment
+overrides still work, for example:
+
+```bash
+NUM_ROLLOUT=1 \
+SGLANG_STABLE_ROLLOUT_MODE=true \
+exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh
+```
+
+For non-GPU command inspection only, use:
+
+```bash
+PRINT_ONLY=1 \
+G1_FILTER_TRAIN_DATA=false \
+exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh
+```
+
+The run artifacts include `G1_EBFT_LOGPROB_INDEXING` in
+`run_context.env`/`hyperparams.env`, and the printed command should include:
+
+```bash
+--g1-ebft-logprob-indexing strict_block_source
+```
+
+The launcher pins `SLIME_ROOT` to the checkout containing the script. This is
+intentional: shared runtime env files such as `/root/slime_runtime/slime_env.sh`
+may export an older `SLIME_ROOT`, but they should not redirect
+`train_async.py`/`train.py` away from the active repository. `PRINT_ONLY=1`
+prints explicit `SLIME_ROOT` and `TRAIN_ENTRY` preflight lines before the full
+submitted command so the final train target is visible without scanning the
+long argv.
+
 ## CPU Smoke Status
 
 The CPU smoke currently verifies the tiny end-to-end strict data path without
@@ -210,6 +262,7 @@ python refactor_debugging/blockwise/inspect_blockwise_contract.py --json
 Focused CPU tests:
 
 ```bash
+pytest tests/test_g1_ebft_launcher_contract.py
 pytest tests/test_strict_blockwise_contract.py
 pytest tests/test_g1_ebft_arguments.py
 pytest tests/test_g1_ebft_data_contract.py
@@ -221,6 +274,7 @@ Combined strict EBFT CPU pass:
 
 ```bash
 pytest \
+  tests/test_g1_ebft_launcher_contract.py \
   tests/test_strict_blockwise_contract.py \
   tests/test_g1_ebft_arguments.py \
   tests/test_g1_ebft_data_contract.py \

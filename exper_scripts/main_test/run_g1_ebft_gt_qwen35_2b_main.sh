@@ -8,13 +8,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER_SLIME_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---------------------------------------------------------------------------
 # 0. Runtime paths
 # ---------------------------------------------------------------------------
 # SLIME_ROOT: this repository. MEGATRON_PATH must point to the Megatron-LM tree
 # used by Slime. PYTHON_BIN is the environment used for Ray workers.
-SLIME_ROOT="${SLIME_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+if [[ -n "${SLIME_ROOT:-}" && "${SLIME_ROOT}" != "${LAUNCHER_SLIME_ROOT}" ]]; then
+  echo "[root-guard] ignoring inherited SLIME_ROOT=${SLIME_ROOT}; launcher root is ${LAUNCHER_SLIME_ROOT}" >&2
+fi
+SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SLIME_ROOT}/../.." && pwd)}"
 MEGATRON_PATH="${MEGATRON_PATH:-/root/slime_runtime/Megatron-LM}"
 SLIME_ENV_FILE="${SLIME_ENV_FILE:-/root/slime_runtime/slime_env.sh}"
@@ -147,6 +151,9 @@ G1_HIDDEN_STATE_METHOD="${G1_HIDDEN_STATE_METHOD:-last_only}"
 G1_EMBEDDING_SOURCE="${G1_EMBEDDING_SOURCE:-megatron_ref}"
 G1_REWARD_LOCATION="${G1_REWARD_LOCATION:-trainer}"
 G1_REF_FORWARD_MODE="${G1_REF_FORWARD_MODE:-openrlhf_exact}"
+# Leave unset for the launcher default. Strict EBFT block-source runs set this
+# to strict_block_source through the wrapper script below.
+G1_EBFT_LOGPROB_INDEXING="${G1_EBFT_LOGPROB_INDEXING:-}"
 USE_WHITENING="${USE_WHITENING:-true}"
 ALIGNMENT_REW_COEF="${ALIGNMENT_REW_COEF:-1.0}"
 DIVERSITY_REW_COEF="${DIVERSITY_REW_COEF:-1.0}"
@@ -186,6 +193,10 @@ DRIVER_LOG="${ARTIFACT_DIR}/ray_job_driver.log"
 if [[ -f "${SLIME_ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${SLIME_ENV_FILE}"
+fi
+if [[ "${SLIME_ROOT:-}" != "${LAUNCHER_SLIME_ROOT}" ]]; then
+  echo "[root-guard] ${SLIME_ENV_FILE} set SLIME_ROOT=${SLIME_ROOT:-<unset>}; restoring launcher root ${LAUNCHER_SLIME_ROOT}" >&2
+  SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
 fi
 
 if [[ -n "${EXTRA_PYTHONPATH:-}" ]]; then
@@ -303,6 +314,10 @@ require_bool "G1_USE_EBFT_LOSS" "${G1_USE_EBFT_LOSS}"
 require_bool "G1_QA_MASKING" "${G1_QA_MASKING}"
 require_bool "USE_WHITENING" "${USE_WHITENING}"
 require_bool "ENABLE_SLIME_EVAL" "${ENABLE_SLIME_EVAL}"
+case "${G1_EBFT_LOGPROB_INDEXING}" in
+  ""|standard_next_token|strict_block_source) ;;
+  *) echo "[ERROR] G1_EBFT_LOGPROB_INDEXING must be empty, standard_next_token, or strict_block_source, got: ${G1_EBFT_LOGPROB_INDEXING}" >&2; exit 1 ;;
+esac
 
 if (( G1_MAX_PROMPT_LABEL_LEN != PROMPT_MAX_LENGTH )); then
   echo "[ERROR] G1_MAX_PROMPT_LABEL_LEN=${G1_MAX_PROMPT_LABEL_LEN} must match PROMPT_MAX_LENGTH=${PROMPT_MAX_LENGTH}" >&2
@@ -538,6 +553,9 @@ CMD=(
   --g1-megatron-ref-forward-mode "${G1_REF_FORWARD_MODE}"
   --g1-ce-loss-coef "${G1_CE_LOSS_COEF}"
 )
+if [[ -n "${G1_EBFT_LOGPROB_INDEXING}" ]]; then
+  CMD+=(--g1-ebft-logprob-indexing "${G1_EBFT_LOGPROB_INDEXING}")
+fi
 if [[ "${USE_WHITENING}" == "true" ]]; then
   CMD+=(--use-whitening)
 fi
@@ -608,6 +626,7 @@ RUN_NAME=${RUN_NAME}
 LOAD_PATH=${LOAD_PATH}
 SAVE_PATH=${SAVE_PATH}
 SLIME_ROOT=${SLIME_ROOT}
+LAUNCHER_SLIME_ROOT=${LAUNCHER_SLIME_ROOT}
 PROJECT_ROOT=${PROJECT_ROOT}
 SLIME_DATA_ROOT=${SLIME_DATA_ROOT}
 PREPARED_DATA_DIR=${PREPARED_DATA_DIR}
@@ -674,6 +693,7 @@ G1_HIDDEN_STATE_METHOD=${G1_HIDDEN_STATE_METHOD}
 G1_EMBEDDING_SOURCE=${G1_EMBEDDING_SOURCE}
 G1_REWARD_LOCATION=${G1_REWARD_LOCATION}
 G1_REF_FORWARD_MODE=${G1_REF_FORWARD_MODE}
+G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING}
 USE_WHITENING=${USE_WHITENING}
 ALIGNMENT_REW_COEF=${ALIGNMENT_REW_COEF}
 DIVERSITY_REW_COEF=${DIVERSITY_REW_COEF}
@@ -704,8 +724,11 @@ echo "[main-test] RUN_NAME=${RUN_NAME}"
 echo "[main-test] NUM_EPOCH=${NUM_EPOCH} NUM_ROLLOUT=${NUM_ROLLOUT:-auto} ENABLE_SLIME_EVAL=${ENABLE_SLIME_EVAL} ENABLE_ASYNC_TRAIN=${ENABLE_ASYNC_TRAIN}"
 echo "[main-test] WEIGHT_DECAY=${WEIGHT_DECAY} ADAM_BETA2=${ADAM_BETA2} EPS_CLIP_HIGH=${EPS_CLIP_HIGH}"
 echo "[preflight] NUM_GPUS=${NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
+echo "[preflight] SLIME_ROOT=${SLIME_ROOT}"
+echo "[preflight] TRAIN_ENTRY=${SLIME_ROOT}/${TRAIN_ENTRYPOINT}"
 echo "[preflight] SGLANG_STABLE_ROLLOUT_MODE=${SGLANG_STABLE_ROLLOUT_MODE} ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE} SGLANG_DIRECT_WORKER_MODE=${SGLANG_DIRECT_WORKER_MODE}"
 echo "[preflight] TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} ACTOR_DP=${DP_SIZE}"
+echo "[preflight] G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING:-launcher-default}"
 echo "[submit] command:"
 printf "%q " "${CMD[@]}"
 echo
