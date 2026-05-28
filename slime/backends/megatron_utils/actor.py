@@ -524,6 +524,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 embeddings["g1_gt_embedding"],
                 rollout_data["response_lengths"],
                 teacher_gen_embeddings=rollout_data.get("g2_teacher_gen_embeddings"),
+                teacher_log_probs=rollout_data.get("teacher_log_probs"),
                 g2_runtime_dump_path=g2_dump_path if g2_dump_enabled else None,
                 g2_dump_writer_metadata=collect_g1_runtime_dump_writer_metadata() if g2_dump_enabled else None,
             )
@@ -725,7 +726,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 if self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
-                    if getattr(self.args, "distribution_reward_type", "pointwise") == "cf_l1oo" and not self._is_standard_g2():
+                    if not self._is_standard_g2():
                         if self.args.use_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                         self._switch_model("ref")

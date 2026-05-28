@@ -175,3 +175,104 @@ def compute_cf_l1oo_rewards(
 
     rewards = rewards.reshape(batch_size, num_groups, num_blocks, n_samples).permute(0, 1, 3, 2).contiguous()
     return rewards.to(dtype=gen_embedding.dtype) * float(cf_reward_scale)
+
+
+@torch.no_grad()
+def compute_opd_cf_l1oo_rewards(
+    gen_embedding: torch.Tensor,
+    teacher_scores: torch.Tensor,
+    *,
+    cf_num_freqs: int = 128,
+    cf_sigma: float = 1.0,
+    cf_seed: int = 43,
+    cf_alpha: float = 0.5,
+    cf_beta: float = 0.5,
+    cf_reward_scale: float = 1.0,
+    score_temperature: float = 1.0,
+) -> torch.Tensor:
+    """OPD-CF-L1OO reward over on-policy student rollout support.
+
+    Shapes:
+    - gen_embedding: (B, G, N, K, D)
+    - teacher_scores: (B, G, N) or (B, G, N, K)
+
+    Teacher scores are converted to weights with a softmax over the N student
+    rollouts within each prompt group. The target distribution shares the same
+    feature support as the student distribution, but is teacher-weighted.
+    """
+    if gen_embedding.ndim != 5:
+        raise ValueError(
+            "OPD-CF-L1OO expects gen_embedding shaped (B, G, N, K, D), "
+            f"got {tuple(gen_embedding.shape)}"
+        )
+    if teacher_scores.ndim not in {3, 4}:
+        raise ValueError(
+            "OPD-CF-L1OO expects teacher_scores shaped (B, G, N) or (B, G, N, K), "
+            f"got {tuple(teacher_scores.shape)}"
+        )
+
+    batch_size, num_groups, n_samples, num_blocks, feat_dim = gen_embedding.shape
+    if n_samples <= 1:
+        raise ValueError("OPD-CF-L1OO requires N > 1 student rollouts per prompt group.")
+    if teacher_scores.shape[:3] != (batch_size, num_groups, n_samples):
+        raise ValueError(
+            "OPD-CF-L1OO teacher_scores must align with gen_embedding on B/G/N dims, "
+            f"got scores={tuple(teacher_scores.shape)} gen={tuple(gen_embedding.shape)}"
+        )
+    if teacher_scores.ndim == 3:
+        teacher_scores = teacher_scores.unsqueeze(-1).expand(-1, -1, -1, num_blocks)
+    elif teacher_scores.shape[3] != num_blocks:
+        raise ValueError(
+            "OPD-CF-L1OO block-level teacher_scores must align with gen_embedding K dim, "
+            f"got scores={tuple(teacher_scores.shape)} gen={tuple(gen_embedding.shape)}"
+        )
+
+    temperature = float(score_temperature)
+    if temperature <= 0.0:
+        raise ValueError("OPD-CF-L1OO score_temperature must be positive.")
+
+    scores = teacher_scores.float() / temperature
+    weights = torch.softmax(scores, dim=2)
+
+    gen_flat = gen_embedding.permute(0, 1, 3, 2, 4).reshape(-1, n_samples, feat_dim).float()
+    weight_flat = weights.permute(0, 1, 3, 2).reshape(-1, n_samples).to(device=gen_flat.device)
+
+    freqs = _get_fixed_cf_frequencies(
+        input_dim=feat_dim,
+        num_freqs=int(cf_num_freqs),
+        sigma=float(cf_sigma),
+        seed=int(cf_seed),
+        device=gen_flat.device,
+    )
+
+    gen_proj = torch.einsum("fd,bnd->bfn", freqs, gen_flat)
+    gen_real_vals = torch.cos(gen_proj)
+    gen_imag_vals = torch.sin(gen_proj)
+
+    student_real = gen_real_vals.mean(dim=-1)
+    student_imag = gen_imag_vals.mean(dim=-1)
+    target_real = (gen_real_vals * weight_flat.unsqueeze(1)).sum(dim=-1)
+    target_imag = (gen_imag_vals * weight_flat.unsqueeze(1)).sum(dim=-1)
+
+    full_loss = _compute_cf_loss_terms(
+        target_real,
+        target_imag,
+        student_real,
+        student_imag,
+        cf_alpha,
+        cf_beta,
+    ).mean(dim=-1)
+
+    loo_real = (gen_real_vals.sum(dim=-1, keepdim=True) - gen_real_vals) / float(n_samples - 1)
+    loo_imag = (gen_imag_vals.sum(dim=-1, keepdim=True) - gen_imag_vals) / float(n_samples - 1)
+    loo_loss = _compute_cf_loss_terms(
+        target_real.unsqueeze(-1),
+        target_imag.unsqueeze(-1),
+        loo_real,
+        loo_imag,
+        cf_alpha,
+        cf_beta,
+    ).mean(dim=1)
+    rewards = loo_loss - full_loss.unsqueeze(-1)
+    rewards = rewards.reshape(batch_size, num_groups, num_blocks, n_samples).permute(0, 1, 3, 2).contiguous()
+    return rewards.to(dtype=gen_embedding.dtype) * float(cf_reward_scale)

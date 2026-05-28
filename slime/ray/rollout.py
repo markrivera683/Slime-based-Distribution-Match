@@ -1250,6 +1250,30 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             model_name=model_cfg.name,
             update_weights=model_cfg.update_weights,
         )
+        if getattr(args, "sglang_direct_worker_mode", False):
+            worker_urls = [
+                url
+                for group in server_groups
+                if group.worker_type == "regular"
+                for url in ray.get([engine.get_url.remote() for engine in group.engines])
+                if url is not None
+            ]
+            if len(worker_urls) != 1:
+                raise ValueError(
+                    f"--sglang-direct-worker-mode expects exactly one regular worker, got {worker_urls}"
+                )
+            worker_url = worker_urls[0].removeprefix("http://")
+            worker_host, worker_port = worker_url.rsplit(":", 1)
+            servers[model_cfg.name].router_ip = worker_host
+            servers[model_cfg.name].router_port = int(worker_port)
+            logger.warning(
+                "Direct SGLang worker mode is enabled; rollout requests for %s go to %s",
+                model_cfg.name,
+                worker_urls[0],
+            )
+            if model_idx == 0:
+                args.sglang_router_ip = worker_host
+                args.sglang_router_port = int(worker_port)
 
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}

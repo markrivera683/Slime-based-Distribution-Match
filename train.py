@@ -27,7 +27,7 @@ def train(args):
         ray.get(rollout_manager.onload_weights.remote())
 
     # always update weight first so that sglang has the loaded weights from training.
-    if not args.critic_train_only:
+    if not args.critic_train_only and not args.skip_initial_update_weights:
         actor_model.update_weights()
 
         if args.check_weight_update_equal:

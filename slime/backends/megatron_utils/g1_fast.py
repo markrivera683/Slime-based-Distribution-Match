@@ -12,7 +12,7 @@ from slime.utils.g1_core import (
     compute_rloo_shaped_rewards,
     expand_block_rewards_to_token_advantages,
 )
-from slime.utils.g2_core import compute_cf_l1oo_rewards
+from slime.utils.g2_core import compute_cf_l1oo_rewards, compute_opd_cf_l1oo_rewards
 
 
 def _whiten_g2_standard_student_embeddings(
@@ -74,6 +74,66 @@ def _whiten_g2_standard_student_embeddings(
         gen_whitened.permute(*inv_perm).contiguous(),
         gt_whitened.permute(*inv_perm).contiguous(),
     )
+
+
+def _teacher_log_probs_to_group_scores(
+    *,
+    teacher_log_probs: list[torch.Tensor] | None,
+    num_groups: int,
+    n_samples_per_prompt: int,
+    device: torch.device,
+    normalization: str,
+) -> torch.Tensor:
+    if teacher_log_probs is None:
+        raise ValueError("OPD-CF-L1OO requires teacher_log_probs.")
+    expected = int(num_groups) * int(n_samples_per_prompt)
+    if len(teacher_log_probs) != expected:
+        raise ValueError(
+            "OPD-CF-L1OO teacher_log_probs must align with rollout samples; "
+            f"got {len(teacher_log_probs)} for {expected} samples."
+        )
+
+    scores = []
+    for sample_idx, log_probs in enumerate(teacher_log_probs):
+        tensor = log_probs.detach().float().reshape(-1).to(device=device)
+        if tensor.numel() == 0:
+            raise ValueError(f"OPD-CF-L1OO teacher_log_probs[{sample_idx}] is empty.")
+        if normalization == "mean":
+            score = tensor.mean()
+        elif normalization == "sum":
+            score = tensor.sum()
+        else:
+            raise ValueError(
+                "Unsupported --opd-cf-score-normalization "
+                f"{normalization!r}; expected 'mean' or 'sum'."
+            )
+        scores.append(score)
+
+    return torch.stack(scores, dim=0).view(1, int(num_groups), int(n_samples_per_prompt))
+
+
+@torch.no_grad()
+def _compute_opd_ebft_credit_rewards(
+    gen_embedding: torch.Tensor,
+    teacher_scores: torch.Tensor,
+    *,
+    reward_scale: float,
+) -> torch.Tensor:
+    if gen_embedding.ndim != 5 or teacher_scores.ndim != 3:
+        raise ValueError(
+            "OPD-EBFT credit expects gen_embedding (B, G, N, K, D) and teacher_scores (B, G, N), "
+            f"got gen={tuple(gen_embedding.shape)} scores={tuple(teacher_scores.shape)}"
+        )
+    if teacher_scores.shape != gen_embedding.shape[:3]:
+        raise ValueError(
+            "OPD-EBFT teacher_scores must align with gen_embedding on B/G/N dims, "
+            f"got scores={tuple(teacher_scores.shape)} gen={tuple(gen_embedding.shape)}"
+        )
+
+    weights = torch.softmax(teacher_scores.float(), dim=2).to(device=gen_embedding.device, dtype=gen_embedding.dtype)
+    target = (gen_embedding * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2, keepdim=True)
+    rewards = torch.nn.functional.cosine_similarity(gen_embedding, target.expand_as(gen_embedding), dim=-1)
+    return rewards * float(reward_scale)
 
 
 def g1_config_from_args(args: Namespace) -> G1EmbeddingConfig:
@@ -383,6 +443,7 @@ def compute_g1_token_advantages_from_embeddings(
     response_lengths: list[int],
     teacher_gen_embeddings: list[torch.Tensor] | None = None,
     *,
+    teacher_log_probs: list[torch.Tensor] | None = None,
     g2_runtime_dump_path: str | None = None,
     g2_dump_writer_metadata: dict[str, Any] | None = None,
 ) -> tuple[list[torch.Tensor], list[float]]:
@@ -423,8 +484,10 @@ def compute_g1_token_advantages_from_embeddings(
     g2_runtime_payload: dict[str, Any] | None = None
     if getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo":
         cf_target_mode = getattr(args, "cf_target_mode", None)
-        if cf_target_mode not in {"single", "teacher"}:
-            raise ValueError("G2 requires --cf-target-mode single or teacher with --distribution-reward-type cf_l1oo")
+        if cf_target_mode not in {"single", "teacher", "opd_onpolicy"}:
+            raise ValueError(
+                "G2 requires --cf-target-mode single, teacher, or opd_onpolicy with --distribution-reward-type cf_l1oo"
+            )
         if cf_target_mode == "teacher" and teacher_gen_embeddings is None:
             raise NotImplementedError(
                 "Standard G2 cf_l1oo teacher mode requires rollout_data['g2_teacher_gen_embeddings'] "
@@ -432,6 +495,8 @@ def compute_g1_token_advantages_from_embeddings(
                 "Use the default SGLang rollout with --teacher-backend remote and compute trainer-side "
                 "embeddings on the frozen critic, or provide this contract via a custom rollout/convert hook."
             )
+        if cf_target_mode == "opd_onpolicy" and teacher_log_probs is None:
+            raise ValueError("OPD-CF-L1OO requires rollout_data['teacher_log_probs'].")
         if teacher_gen_embeddings is not None and len(teacher_gen_embeddings) != len(gen_embeddings):
             raise ValueError(
                 "G2 teacher_gen_embeddings must align with samples; "
@@ -472,11 +537,18 @@ def compute_g1_token_advantages_from_embeddings(
             raise ValueError("Standard G2 requires --use-whitening to match OpenRLHF reward construction.")
         raw_gen = gen
         raw_gt = gt
-        gen, gt = _whiten_g2_standard_student_embeddings(
-            gen,
-            gt,
-            whiten_tol=float(getattr(args, "whiten_tol", 1e-5)),
-        )
+        if cf_target_mode == "opd_onpolicy":
+            gen, _ = _whiten_g2_standard_student_embeddings(
+                gen,
+                gen,
+                whiten_tol=float(getattr(args, "whiten_tol", 1e-5)),
+            )
+        else:
+            gen, gt = _whiten_g2_standard_student_embeddings(
+                gen,
+                gt,
+                whiten_tol=float(getattr(args, "whiten_tol", 1e-5)),
+            )
         cf_args = {
             "cf_num_freqs": int(getattr(args, "cf_num_freqs", 128)),
             "cf_sigma": float(getattr(args, "cf_sigma", 1.0)),
@@ -489,23 +561,60 @@ def compute_g1_token_advantages_from_embeddings(
             "cf_target_num_refs": int(getattr(args, "cf_target_num_refs", 1)),
             "cf_target_std": float(getattr(args, "cf_target_std", 0.05)),
             "cf_target_seed": int(getattr(args, "cf_target_seed", 43)),
+            "opd_cf_score_temperature": float(getattr(args, "opd_cf_score_temperature", 1.0)),
+            "opd_cf_score_normalization": str(getattr(args, "opd_cf_score_normalization", "mean")),
+            "opd_credit_assignment": str(getattr(args, "opd_credit_assignment", "cf_l1oo")),
         }
-        rewards = compute_cf_l1oo_rewards(
-            gen,
-            gt,
-            teacher_embedding=teacher,
-            cf_num_freqs=cf_args["cf_num_freqs"],
-            cf_sigma=cf_args["cf_sigma"],
-            cf_seed=cf_args["cf_seed"],
-            cf_alpha=cf_args["cf_alpha"],
-            cf_beta=cf_args["cf_beta"],
-            cf_reward_scale=cf_args["cf_reward_scale"],
-            cf_target_mode=cf_args["cf_target_mode"],
-            cf_target_num_refs=cf_args["cf_target_num_refs"],
-            cf_target_std=cf_args["cf_target_std"],
-            cf_target_seed=cf_args["cf_target_seed"],
-            cf_teacher_lambda=cf_args["cf_teacher_lambda"],
-        )
+        teacher_scores = None
+        if cf_target_mode == "opd_onpolicy":
+            teacher_scores = _teacher_log_probs_to_group_scores(
+                teacher_log_probs=teacher_log_probs,
+                num_groups=num_groups,
+                n_samples_per_prompt=n_samples_per_prompt,
+                device=gen.device,
+                normalization=cf_args["opd_cf_score_normalization"],
+            )
+            teacher_scores = teacher_scores / cf_args["opd_cf_score_temperature"]
+            if cf_args["opd_credit_assignment"] == "cf_l1oo":
+                rewards = compute_opd_cf_l1oo_rewards(
+                    gen,
+                    teacher_scores,
+                    cf_num_freqs=cf_args["cf_num_freqs"],
+                    cf_sigma=cf_args["cf_sigma"],
+                    cf_seed=cf_args["cf_seed"],
+                    cf_alpha=cf_args["cf_alpha"],
+                    cf_beta=cf_args["cf_beta"],
+                    cf_reward_scale=cf_args["cf_reward_scale"],
+                    score_temperature=1.0,
+                )
+            elif cf_args["opd_credit_assignment"] == "ebft":
+                rewards = _compute_opd_ebft_credit_rewards(
+                    gen,
+                    teacher_scores,
+                    reward_scale=cf_args["cf_reward_scale"],
+                )
+            else:
+                raise ValueError(
+                    "Unsupported --opd-credit-assignment "
+                    f"{cf_args['opd_credit_assignment']!r}; expected 'cf_l1oo' or 'ebft'."
+                )
+        else:
+            rewards = compute_cf_l1oo_rewards(
+                gen,
+                gt,
+                teacher_embedding=teacher,
+                cf_num_freqs=cf_args["cf_num_freqs"],
+                cf_sigma=cf_args["cf_sigma"],
+                cf_seed=cf_args["cf_seed"],
+                cf_alpha=cf_args["cf_alpha"],
+                cf_beta=cf_args["cf_beta"],
+                cf_reward_scale=cf_args["cf_reward_scale"],
+                cf_target_mode=cf_args["cf_target_mode"],
+                cf_target_num_refs=cf_args["cf_target_num_refs"],
+                cf_target_std=cf_args["cf_target_std"],
+                cf_target_seed=cf_args["cf_target_seed"],
+                cf_teacher_lambda=cf_args["cf_teacher_lambda"],
+            )
         if g2_runtime_dump_path:
             g2_runtime_payload = {
                 "source": "slime_megatron_standard_g2_runtime",
@@ -516,6 +625,7 @@ def compute_g1_token_advantages_from_embeddings(
                 "g2_raw_student_gt_tensor": raw_gt.detach().cpu(),
                 "g2_teacher_gen_embeddings": [t.detach().cpu() for t in teacher_gen_embeddings] if teacher_gen_embeddings is not None else None,
                 "g2_teacher_gen_tensor": teacher.detach().cpu() if teacher is not None else None,
+                "opd_cf_teacher_scores": teacher_scores.detach().cpu() if teacher_scores is not None else None,
                 "g2_whitened_student_gen_tensor": gen.detach().cpu(),
                 "g2_whitened_student_gt_tensor": gt.detach().cpu(),
                 "g2_cf_l1oo_rewards": rewards.detach().cpu(),
@@ -542,7 +652,19 @@ def compute_g1_token_advantages_from_embeddings(
                 "use_whitening": bool(getattr(args, "use_whitening", False)),
                 "whiten_tol": float(getattr(args, "whiten_tol", 1e-5)),
             }
-        shaped_rewards = rewards
+        if cf_target_mode == "opd_onpolicy" and cf_args["opd_credit_assignment"] == "ebft":
+            rloo_rewards = rewards.reshape(rewards.shape[0], num_groups * n_samples_per_prompt, num_blocks)
+            shaped_rewards, _ = compute_rloo_shaped_rewards(
+                rloo_rewards,
+                torch.zeros_like(rloo_rewards),
+                rloo_rewards,
+                n_samples_per_prompt=n_samples_per_prompt,
+                alignment_rew_coef=1.0,
+                diversity_rew_coef=0.0,
+            )
+            shaped_rewards = shaped_rewards.reshape_as(rewards)
+        else:
+            shaped_rewards = rewards
     else:
         alignment_rew_coef = float(getattr(args, "alignment_rew_coef", 1.0))
         diversity_rew_coef = float(getattr(args, "diversity_rew_coef", 1.0))

@@ -96,6 +96,7 @@ ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-4096}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.7}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
 
 # ---------------------------------------------------------------------------
 # 5. Optimizer and G2 actor/critic knobs
@@ -115,6 +116,11 @@ ZERO_STAGE="${ZERO_STAGE:-3}"
 # 6. G2 counterfactual teacher and OPD
 # ---------------------------------------------------------------------------
 G2_OPD_MODE="${G2_OPD_MODE:-cf_l1oo_opd_sglang}"
+CF_TARGET_MODE="${CF_TARGET_MODE:-teacher}"
+OPD_CREDIT_ASSIGNMENT="${OPD_CREDIT_ASSIGNMENT:-cf_l1oo}"
+OPD_CF_SCORE_TEMPERATURE="${OPD_CF_SCORE_TEMPERATURE:-1.0}"
+OPD_CF_SCORE_NORMALIZATION="${OPD_CF_SCORE_NORMALIZATION:-mean}"
+OPD_KL_APPLICATION="${OPD_KL_APPLICATION:-auto}"
 CF_TEACHER_LAMBDA="${CF_TEACHER_LAMBDA:-0.6}"
 CF_TEACHER_N_SAMPLES="${CF_TEACHER_N_SAMPLES:-4}"
 TEACHER_BACKEND="${TEACHER_BACKEND:-remote}"
@@ -243,6 +249,12 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTHONUNBUFFERED=1
 export RAY_TMPDIR
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
+if [[ -n "${NO_PROXY:-}" ]]; then
+  export NO_PROXY="${NO_PROXY},127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+else
+  export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+fi
+export no_proxy="${NO_PROXY}"
 
 # two_node student follows G1 main: async Megatron + SGLang rollout by default.
 if [[ -z "${ENABLE_ASYNC_TRAIN+x}" ]]; then
@@ -322,6 +334,9 @@ require_positive_int "G1_GENERATE_LENGTH" "${G1_GENERATE_LENGTH}"
 require_positive_int "G1_STRIDE" "${G1_STRIDE}"
 require_positive_int "G1_RESPONSE_LENGTH" "${G1_RESPONSE_LENGTH}"
 require_positive_int "CF_TEACHER_N_SAMPLES" "${CF_TEACHER_N_SAMPLES}"
+if [[ ! "${SAVE_INTERVAL}" =~ ^(none|off|false)$ ]]; then
+  require_positive_int "SAVE_INTERVAL" "${SAVE_INTERVAL}"
+fi
 require_bool "G1_FILTER_TRAIN_DATA" "${G1_FILTER_TRAIN_DATA}"
 require_bool "G1_USE_EBFT_LOSS" "${G1_USE_EBFT_LOSS}"
 require_bool "USE_WHITENING" "${USE_WHITENING}"
@@ -329,6 +344,7 @@ require_bool "TEACHER_CACHE_ENABLE" "${TEACHER_CACHE_ENABLE}"
 require_bool "TEACHER_SGLANG_MULTI_SAMPLE" "${TEACHER_SGLANG_MULTI_SAMPLE}"
 require_bool "ENABLE_SLIME_EVAL" "${ENABLE_SLIME_EVAL}"
 require_bool "ENABLE_G2_POST_EVAL" "${ENABLE_G2_POST_EVAL}"
+require_bool "SGLANG_DISABLE_CUDA_GRAPH" "${SGLANG_DISABLE_CUDA_GRAPH}"
 
 case "${DEPLOY_LAYOUT}" in
   single_node|two_node) ;;
@@ -561,9 +577,6 @@ CMD=(
   --hf-checkpoint "${MODEL_PATH}"
   --ref-load "${REF_LOAD}"
   --load "${LOAD_PATH}"
-  --save "${SAVE_PATH}"
-  --critic-save "${CRITIC_SAVE_PATH}"
-  --save-interval "${SAVE_INTERVAL}"
   --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS}"
   --prompt-data "${SLIME_TRAIN_DATA}"
   --input-key prompt
@@ -588,25 +601,14 @@ CMD=(
   --adam-beta2 "${ADAM_BETA2}"
   --advantage-estimator g1
   --distribution-reward-type cf_l1oo
-  --cf-target-mode teacher
-  --cf-teacher-lambda "${CF_TEACHER_LAMBDA}"
-  --cf-teacher-n-samples "${CF_TEACHER_N_SAMPLES}"
-  --teacher-backend "${TEACHER_BACKEND}"
-  --teacher-api-base "${TEACHER_API_BASE}"
-  --teacher-api-key "${TEACHER_API_KEY}"
-  --teacher-api-style "${TEACHER_API_STYLE}"
-  --teacher-model-name "${TEACHER_MODEL_NAME}"
-  --teacher-timeout "${TEACHER_TIMEOUT}"
-  --teacher-max-retries "${TEACHER_MAX_RETRIES}"
-  --teacher-remote-batch-size "${TEACHER_REMOTE_BATCH_SIZE}"
-  --teacher-temperature "${TEACHER_TEMPERATURE}"
-  --teacher-top-p "${TEACHER_TOP_P}"
-  --teacher-max-new-tokens "${TEACHER_MAX_NEW_TOKENS}"
-  --teacher-system-prompt-text "${TEACHER_SYSTEM_PROMPT_TEXT}"
-  --teacher-system-prompt-id "${TEACHER_SYSTEM_PROMPT_ID}"
+  --cf-target-mode "${CF_TARGET_MODE}"
+  --opd-credit-assignment "${OPD_CREDIT_ASSIGNMENT}"
+  --opd-cf-score-temperature "${OPD_CF_SCORE_TEMPERATURE}"
+  --opd-cf-score-normalization "${OPD_CF_SCORE_NORMALIZATION}"
   --use-opd
   --opd-type sglang
   --opd-kl-coef "${OPD_KL_COEF}"
+  --opd-kl-application "${OPD_KL_APPLICATION}"
   --custom-rm-path slime.rollout.on_policy_distillation.reward_func
   --custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
   --rm-url "${OPD_TEACHER_RM_URL}"
@@ -652,6 +654,9 @@ else
   require_positive_int "NUM_EPOCH" "${NUM_EPOCH}"
   CMD+=(--num-epoch "${NUM_EPOCH}")
 fi
+if [[ ! "${SAVE_INTERVAL}" =~ ^(none|off|false)$ ]]; then
+  CMD+=(--save "${SAVE_PATH}" --critic-save "${CRITIC_SAVE_PATH}" --save-interval "${SAVE_INTERVAL}")
+fi
 if [[ "${ENABLE_G2_POST_EVAL}" == "true" ]]; then
   CMD+=(--save-hf "${SAVE_HF_PATH_TEMPLATE}")
 fi
@@ -661,13 +666,35 @@ fi
 if [[ "${G1_USE_EBFT_LOSS}" == "true" ]]; then
   CMD+=(--g1-use-ebft-loss)
 fi
-if [[ "${TEACHER_CACHE_ENABLE}" == "true" ]]; then
-  CMD+=(--teacher-cache-enable --teacher-cache-dir "${TEACHER_CACHE_DIR}")
+if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" == "true" ]]; then
+  CMD+=(--sglang-disable-cuda-graph)
 fi
-if [[ "${TEACHER_SGLANG_MULTI_SAMPLE}" == "true" ]]; then
-  CMD+=(--teacher-sglang-multi-sample)
-else
-  CMD+=(--no-teacher-sglang-multi-sample)
+if [[ "${CF_TARGET_MODE}" == "teacher" ]]; then
+  CMD+=(
+    --cf-teacher-lambda "${CF_TEACHER_LAMBDA}"
+    --cf-teacher-n-samples "${CF_TEACHER_N_SAMPLES}"
+    --teacher-backend "${TEACHER_BACKEND}"
+    --teacher-api-base "${TEACHER_API_BASE}"
+    --teacher-api-key "${TEACHER_API_KEY}"
+    --teacher-api-style "${TEACHER_API_STYLE}"
+    --teacher-model-name "${TEACHER_MODEL_NAME}"
+    --teacher-timeout "${TEACHER_TIMEOUT}"
+    --teacher-max-retries "${TEACHER_MAX_RETRIES}"
+    --teacher-remote-batch-size "${TEACHER_REMOTE_BATCH_SIZE}"
+    --teacher-temperature "${TEACHER_TEMPERATURE}"
+    --teacher-top-p "${TEACHER_TOP_P}"
+    --teacher-max-new-tokens "${TEACHER_MAX_NEW_TOKENS}"
+    --teacher-system-prompt-text "${TEACHER_SYSTEM_PROMPT_TEXT}"
+    --teacher-system-prompt-id "${TEACHER_SYSTEM_PROMPT_ID}"
+  )
+  if [[ "${TEACHER_CACHE_ENABLE}" == "true" ]]; then
+    CMD+=(--teacher-cache-enable --teacher-cache-dir "${TEACHER_CACHE_DIR}")
+  fi
+  if [[ "${TEACHER_SGLANG_MULTI_SAMPLE}" == "true" ]]; then
+    CMD+=(--teacher-sglang-multi-sample)
+  else
+    CMD+=(--no-teacher-sglang-multi-sample)
+  fi
 fi
 if [[ "${COLOCATE}" == "true" ]]; then
   CMD+=(--colocate)
@@ -719,6 +746,11 @@ TEACHER_PORT=${TEACHER_PORT}
 RAY_NODE_IP_ADDRESS=${RAY_NODE_IP_ADDRESS}
 RAY_ADDRESS=${RAY_ADDRESS}
 G2_OPD_MODE=${G2_OPD_MODE}
+CF_TARGET_MODE=${CF_TARGET_MODE}
+OPD_CREDIT_ASSIGNMENT=${OPD_CREDIT_ASSIGNMENT}
+OPD_CF_SCORE_TEMPERATURE=${OPD_CF_SCORE_TEMPERATURE}
+OPD_CF_SCORE_NORMALIZATION=${OPD_CF_SCORE_NORMALIZATION}
+OPD_KL_APPLICATION=${OPD_KL_APPLICATION}
 LOAD_PATH=${LOAD_PATH}
 SAVE_PATH=${SAVE_PATH}
 CRITIC_SAVE_PATH=${CRITIC_SAVE_PATH}
@@ -852,7 +884,8 @@ echo "[main-test] DEPLOY_LAYOUT=${DEPLOY_LAYOUT} DEPLOY_ROLE=${DEPLOY_ROLE} RAY_
 echo "[main-test] RUN_NAME=${RUN_NAME}"
 echo "[main-test] mode=${G2_OPD_MODE} NUM_EPOCH=${NUM_EPOCH} NUM_ROLLOUT=${NUM_ROLLOUT:-auto} ENABLE_SLIME_EVAL=${ENABLE_SLIME_EVAL} ENABLE_G2_POST_EVAL=${ENABLE_G2_POST_EVAL}"
 echo "[main-test] teacher=${TEACHER_API_BASE} style=${TEACHER_API_STYLE} model=${TEACHER_MODEL_NAME} opd_rm=${OPD_TEACHER_RM_URL}"
-echo "[main-test] cf_l1oo lambda=${CF_TEACHER_LAMBDA} teacher_samples=${CF_TEACHER_N_SAMPLES} opd_kl=${OPD_KL_COEF} teacher_cache=${TEACHER_CACHE_ENABLE}"
+echo "[main-test] cf_target=${CF_TARGET_MODE} opd_credit=${OPD_CREDIT_ASSIGNMENT} opd_cf_norm=${OPD_CF_SCORE_NORMALIZATION} opd_cf_temp=${OPD_CF_SCORE_TEMPERATURE} opd_kl=${OPD_KL_COEF} opd_kl_application=${OPD_KL_APPLICATION}"
+echo "[main-test] teacher_completion lambda=${CF_TEACHER_LAMBDA} teacher_samples=${CF_TEACHER_N_SAMPLES} teacher_cache=${TEACHER_CACHE_ENABLE}"
 echo "[main-test] ebft_loss=${G1_USE_EBFT_LOSS} ce_loss_coef=${G1_CE_LOSS_COEF}"
 echo "[preflight] NUM_GPUS=${NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} CRITIC_NUM_NODES=${CRITIC_NUM_NODES} CRITIC_NUM_GPUS_PER_NODE=${CRITIC_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
 echo "[preflight] TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} ACTOR_DP=${DP_SIZE}"
@@ -868,23 +901,24 @@ fi
 if [[ "${SKIP_TEACHER_PREFLIGHT}" == "1" ]]; then
   echo "[preflight] skipping teacher API reachability checks because SKIP_TEACHER_PREFLIGHT=1"
 else
-  if [[ "${TEACHER_API_STYLE}" == "sglang_generate" ]]; then
-    if [[ "${TEACHER_API_BASE%/}" == */generate ]]; then
-      TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}"
+  if [[ "${CF_TARGET_MODE}" == "teacher" ]]; then
+    if [[ "${TEACHER_API_STYLE}" == "sglang_generate" ]]; then
+      if [[ "${TEACHER_API_BASE%/}" == */generate ]]; then
+        TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}"
+      else
+        TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}/generate"
+      fi
+      TEACHER_PREFLIGHT_METHOD="POST_GENERATE"
     else
-      TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}/generate"
+      TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}/models"
+      TEACHER_PREFLIGHT_METHOD="GET_MODELS"
     fi
-    TEACHER_PREFLIGHT_METHOD="POST_GENERATE"
-  else
-    TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}/models"
-    TEACHER_PREFLIGHT_METHOD="GET_MODELS"
-  fi
-  echo "[preflight] checking G2 teacher API reachability: ${TEACHER_PREFLIGHT_URL}"
-  if ! TEACHER_PREFLIGHT_URL="${TEACHER_PREFLIGHT_URL}" \
-       TEACHER_PREFLIGHT_METHOD="${TEACHER_PREFLIGHT_METHOD}" \
-       TEACHER_API_KEY="${TEACHER_API_KEY}" \
-       TEACHER_PREFLIGHT_TIMEOUT="${TEACHER_PREFLIGHT_TIMEOUT}" \
-       "${PYTHON_BIN}" - <<'PY'
+    echo "[preflight] checking G2 teacher API reachability: ${TEACHER_PREFLIGHT_URL}"
+    if ! TEACHER_PREFLIGHT_URL="${TEACHER_PREFLIGHT_URL}" \
+         TEACHER_PREFLIGHT_METHOD="${TEACHER_PREFLIGHT_METHOD}" \
+         TEACHER_API_KEY="${TEACHER_API_KEY}" \
+         TEACHER_PREFLIGHT_TIMEOUT="${TEACHER_PREFLIGHT_TIMEOUT}" \
+         "${PYTHON_BIN}" - <<'PY'
 import json
 import os
 import sys
@@ -920,10 +954,13 @@ except Exception as exc:
     print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
     raise SystemExit(1)
 PY
-  then
-    echo "[ERROR] G2 teacher API preflight failed for ${TEACHER_PREFLIGHT_URL}" >&2
-    echo "[ERROR] Start the teacher service first, or set SKIP_TEACHER_PREFLIGHT=1 for special network environments." >&2
-    exit 1
+    then
+      echo "[ERROR] G2 teacher API preflight failed for ${TEACHER_PREFLIGHT_URL}" >&2
+      echo "[ERROR] Start the teacher service first, or set SKIP_TEACHER_PREFLIGHT=1 for special network environments." >&2
+      exit 1
+    fi
+  else
+    echo "[preflight] skipping G2 teacher-completion API check for CF_TARGET_MODE=${CF_TARGET_MODE}"
   fi
 
   echo "[preflight] checking OPD reward/logprob API reachability: ${OPD_TEACHER_RM_URL}"
@@ -940,14 +977,15 @@ url = os.environ["OPD_TEACHER_RM_URL"]
 timeout = float(os.environ.get("TEACHER_PREFLIGHT_TIMEOUT", "5"))
 api_key = os.environ.get("TEACHER_API_KEY", "EMPTY")
 payload = {
-    "text": "ping",
+    "input_ids": [0, 1],
     "sampling_params": {
         "temperature": 0.0,
         "top_p": 1.0,
-        "max_new_tokens": 1,
-        "skip_special_tokens": True,
+        "max_new_tokens": 0,
+        "skip_special_tokens": False,
     },
     "return_logprob": True,
+    "logprob_start_len": 0,
 }
 request = urllib.request.Request(
     url,
@@ -957,7 +995,13 @@ request = urllib.request.Request(
 )
 try:
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        response.read(1)
+        result = json.loads(response.read().decode("utf-8"))
+    token_logprobs = result.get("meta_info", {}).get("input_token_logprobs")
+    if not isinstance(token_logprobs, list) or len(token_logprobs) < 2:
+        raise RuntimeError("missing meta_info.input_token_logprobs in OPD preflight response")
+    scored = [item[0] for item in token_logprobs[1:] if isinstance(item, (list, tuple)) and item]
+    if not any(isinstance(value, (int, float)) for value in scored):
+        raise RuntimeError("OPD preflight response has no numeric input token logprobs")
 except Exception as exc:
     print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
     raise SystemExit(1)
@@ -967,6 +1011,11 @@ PY
     echo "[ERROR] Set OPD_TEACHER_RM_URL to the SGLang /generate endpoint that can return logprobs." >&2
     exit 1
   fi
+fi
+
+if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  echo "[preflight] PREFLIGHT_ONLY=1; exiting before Ray startup"
+  exit 0
 fi
 
 "${RAY_BIN}" stop --force 2>/dev/null || true
@@ -988,6 +1037,8 @@ keys = [
     "CUDA_DEVICE_MAX_CONNECTIONS", "HF_HOME", "HF_HUB_OFFLINE",
     "HF_DATASETS_OFFLINE", "HF_HUB_DISABLE_XET", "TOKENIZERS_PARALLELISM",
     "RAY_TMPDIR", "PYTHONUNBUFFERED", "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK",
+    "SLIME_SGLANG_HEALTH_TIMEOUT", "SLIME_SGLANG_HEALTH_MAX_WAIT",
+    "NO_PROXY", "no_proxy",
 ]
 print(json.dumps({"env_vars": {k: os.environ[k] for k in keys if os.environ.get(k)}}))
 PY

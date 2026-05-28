@@ -20,6 +20,7 @@ from slime.rollout.g2_teacher import (
     G2RemoteTeacherConfig,
     G2TeacherCache,
     attach_g2_teacher_completions,
+    uses_standard_g2_remote_teacher,
 )
 from slime.ray import rollout as rollout_module
 from slime.ray.rollout import RolloutManager
@@ -43,7 +44,8 @@ from slime.utils.g1_core import (
     prepare_strided_token_blocks,
     whiten_embeddings_batched,
 )
-from slime.utils.g2_core import compute_cf_l1oo_rewards
+from slime.utils.arguments import assert_g2_standard_args
+from slime.utils.g2_core import compute_cf_l1oo_rewards, compute_opd_cf_l1oo_rewards
 from slime.utils.types import Sample
 
 
@@ -778,6 +780,75 @@ def test_g1_advantage_estimator_consumes_precomputed_token_advantages(monkeypatc
     torch.testing.assert_close(rollout_data["returns"][0], rollout_data["advantages"][0])
 
 
+def _base_opd_g1_args(*, opd_kl_application="auto", cf_target_mode="teacher"):
+    return Namespace(
+        use_rollout_logprobs=False,
+        kl_coef=0.0,
+        advantage_estimator="g1",
+        use_opd=True,
+        opd_type="sglang",
+        opd_kl_coef=2.0,
+        opd_kl_application=opd_kl_application,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode=cf_target_mode,
+        normalize_advantages=False,
+    )
+
+
+def _base_opd_rollout_data():
+    return {
+        "log_probs": [torch.tensor([0.0, -1.0])],
+        "teacher_log_probs": [torch.tensor([-0.5, -1.5])],
+        "rewards": [0.0],
+        "g1_token_advantages": [torch.tensor([1.0, 1.0])],
+        "response_lengths": [2],
+        "total_lengths": [4],
+        "loss_masks": [torch.ones(2)],
+    }
+
+
+def test_opd_token_penalty_application_preserves_current_subtraction(monkeypatch):
+    monkeypatch.setattr(loss_module.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    rollout_data = _base_opd_rollout_data()
+
+    loss_module.compute_advantages_and_returns(
+        _base_opd_g1_args(opd_kl_application="token_penalty"),
+        rollout_data,
+    )
+
+    torch.testing.assert_close(rollout_data["opd_reverse_kl"][0], torch.tensor([0.5, 0.5]))
+    torch.testing.assert_close(rollout_data["advantages"][0], torch.tensor([0.0, 0.0]))
+
+
+def test_opd_cf_l1oo_application_logs_reverse_kl_without_mutating_advantages(monkeypatch):
+    monkeypatch.setattr(loss_module.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    rollout_data = _base_opd_rollout_data()
+
+    loss_module.compute_advantages_and_returns(
+        _base_opd_g1_args(opd_kl_application="auto", cf_target_mode="opd_onpolicy"),
+        rollout_data,
+    )
+
+    torch.testing.assert_close(rollout_data["opd_reverse_kl"][0], torch.tensor([0.5, 0.5]))
+    torch.testing.assert_close(rollout_data["advantages"][0], torch.tensor([1.0, 1.0]))
+
+
+def test_opd_both_application_logs_reverse_kl_and_applies_penalty(monkeypatch):
+    monkeypatch.setattr(loss_module.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    rollout_data = _base_opd_rollout_data()
+
+    loss_module.compute_advantages_and_returns(
+        _base_opd_g1_args(opd_kl_application="both", cf_target_mode="opd_onpolicy"),
+        rollout_data,
+    )
+
+    torch.testing.assert_close(rollout_data["opd_reverse_kl"][0], torch.tensor([0.5, 0.5]))
+    torch.testing.assert_close(rollout_data["advantages"][0], torch.tensor([0.0, 0.0]))
+
+
 def test_g1_advantage_estimator_rejects_response_level_shape_mismatch(monkeypatch):
     monkeypatch.setattr(loss_module.mpu, "is_pipeline_last_stage", lambda: True)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
@@ -1250,6 +1321,178 @@ def test_g2_cf_l1oo_teacher_rewards_shape_and_nonzero():
     assert rewards.abs().sum() > 0
 
 
+def test_opd_cf_l1oo_rewards_prefer_high_teacher_score_sample():
+    gen = torch.tensor([[[[[0.0]], [[1.0]], [[2.0]]]]], dtype=torch.float32)
+    teacher_scores = torch.tensor([[[0.0, 0.0, 4.0]]], dtype=torch.float32)
+
+    rewards = compute_opd_cf_l1oo_rewards(
+        gen,
+        teacher_scores,
+        cf_num_freqs=16,
+        cf_sigma=1.0,
+        cf_seed=7,
+    )
+
+    assert tuple(rewards.shape) == (1, 1, 3, 1)
+    assert torch.isfinite(rewards).all()
+    assert rewards[0, 0, 2, 0] > rewards[0, 0, 0, 0]
+
+
+def test_opd_cf_l1oo_uniform_teacher_weights_are_symmetric():
+    gen = torch.tensor([[[[[-1.0]], [[0.0]], [[1.0]]]]], dtype=torch.float32)
+    teacher_scores = torch.zeros(1, 1, 3)
+
+    rewards = compute_opd_cf_l1oo_rewards(
+        gen,
+        teacher_scores,
+        cf_num_freqs=16,
+        cf_sigma=1.0,
+        cf_seed=11,
+    )
+
+    assert torch.isfinite(rewards).all()
+    assert torch.all(rewards > 0)
+    torch.testing.assert_close(rewards[0, 0, 0, 0], rewards[0, 0, 2, 0])
+
+
+def test_g2_trainer_side_opd_onpolicy_requires_teacher_log_probs():
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="opd_onpolicy",
+        g1_response_length=2,
+        use_whitening=True,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        opd_cf_score_temperature=1.0,
+        opd_cf_score_normalization="mean",
+    )
+    gen_embeddings = [torch.ones(1, 2), torch.ones(1, 2) * 2]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+
+    with pytest.raises(ValueError, match="teacher_log_probs"):
+        compute_g1_token_advantages_from_embeddings(args, gen_embeddings, gt_embeddings, [2, 2])
+
+
+def test_g2_trainer_side_opd_onpolicy_uses_teacher_log_probs_without_teacher_embeddings():
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="opd_onpolicy",
+        g1_response_length=2,
+        use_whitening=True,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        opd_cf_score_temperature=1.0,
+        opd_cf_score_normalization="mean",
+    )
+    gen_embeddings = [
+        torch.tensor([[1.0, 0.0]]),
+        torch.tensor([[0.0, 1.0]]),
+    ]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+    teacher_log_probs = [torch.tensor([-0.1, -0.2]), torch.tensor([-2.0, -2.2])]
+
+    token_advantages, scalar_rewards = compute_g1_token_advantages_from_embeddings(
+        args,
+        gen_embeddings,
+        gt_embeddings,
+        [2, 2],
+        teacher_log_probs=teacher_log_probs,
+    )
+
+    assert len(token_advantages) == 2
+    assert all(tuple(adv.shape) == (2,) for adv in token_advantages)
+    assert all(torch.isfinite(adv).all() for adv in token_advantages)
+    assert all(isinstance(value, float) for value in scalar_rewards)
+
+
+def test_g2_trainer_side_opd_onpolicy_ebft_credit_baseline():
+    args = Namespace(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="opd_onpolicy",
+        g1_response_length=2,
+        use_whitening=True,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        opd_cf_score_temperature=1.0,
+        opd_cf_score_normalization="mean",
+        opd_credit_assignment="ebft",
+    )
+    gen_embeddings = [
+        torch.tensor([[1.0, 0.0]]),
+        torch.tensor([[0.0, 1.0]]),
+    ]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+    teacher_log_probs = [torch.tensor([-0.1, -0.2]), torch.tensor([-2.0, -2.2])]
+
+    token_advantages, scalar_rewards = compute_g1_token_advantages_from_embeddings(
+        args,
+        gen_embeddings,
+        gt_embeddings,
+        [2, 2],
+        teacher_log_probs=teacher_log_probs,
+    )
+
+    assert len(token_advantages) == 2
+    assert all(tuple(adv.shape) == (2,) for adv in token_advantages)
+    assert all(torch.isfinite(adv).all() for adv in token_advantages)
+    assert scalar_rewards[0] > scalar_rewards[1]
+
+
+def test_g2_trainer_side_opd_onpolicy_score_normalization_changes_rewards():
+    base_args = dict(
+        n_samples_per_prompt=2,
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="opd_onpolicy",
+        g1_response_length=2,
+        use_whitening=True,
+        cf_num_freqs=8,
+        cf_sigma=1.0,
+        cf_seed=7,
+        cf_alpha=0.5,
+        cf_beta=0.5,
+        cf_reward_scale=1.0,
+        opd_cf_score_temperature=1.0,
+    )
+    gen_embeddings = [
+        torch.tensor([[1.0, 0.0]]),
+        torch.tensor([[0.0, 1.0]]),
+    ]
+    gt_embeddings = [torch.zeros(1, 2), torch.zeros(1, 2)]
+    teacher_log_probs = [torch.tensor([-0.1, -0.1]), torch.tensor([-0.1, -2.1])]
+
+    _, mean_rewards = compute_g1_token_advantages_from_embeddings(
+        Namespace(**base_args, opd_cf_score_normalization="mean"),
+        gen_embeddings,
+        gt_embeddings,
+        [2, 2],
+        teacher_log_probs=teacher_log_probs,
+    )
+    _, sum_rewards = compute_g1_token_advantages_from_embeddings(
+        Namespace(**base_args, opd_cf_score_normalization="sum"),
+        gen_embeddings,
+        gt_embeddings,
+        [2, 2],
+        teacher_log_probs=teacher_log_probs,
+    )
+
+    assert mean_rewards != sum_rewards
+
+
 def test_g2_trainer_side_cf_l1oo_requires_teacher_embeddings():
     args = Namespace(
         n_samples_per_prompt=2,
@@ -1495,6 +1738,58 @@ def test_g2_attach_teacher_completions_shares_group_outputs(monkeypatch):
     assert group[0].metadata["g2_teacher_completions"] == ["xy", "yx"]
     assert group[1].metadata["g2_teacher_completions"] == ["xy", "yx"]
     assert group[0].metadata["g2_teacher_completions"] is group[1].metadata["g2_teacher_completions"]
+
+
+def _base_g2_arg_validation(**overrides):
+    values = dict(
+        distribution_reward_type="cf_l1oo",
+        cf_target_mode="opd_onpolicy",
+        advantage_estimator="g1",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        use_opd=True,
+        opd_type="sglang",
+        n_samples_per_prompt=2,
+        use_whitening=True,
+        opd_cf_score_temperature=1.0,
+        teacher_backend=None,
+        teacher_api_base=None,
+        teacher_model_name=None,
+        cf_teacher_n_samples=4,
+        cf_teacher_lambda=0.6,
+        critic_lr=0.0,
+        critic_lr_head=0.0,
+        zero_stage=3,
+        opd_credit_assignment="cf_l1oo",
+    )
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_g2_arg_validation_accepts_opd_onpolicy_without_teacher_completion_config():
+    args = _base_g2_arg_validation()
+
+    assert_g2_standard_args(args)
+    assert not uses_standard_g2_remote_teacher(args)
+
+
+def test_g2_arg_validation_rejects_opd_onpolicy_without_opd():
+    args = _base_g2_arg_validation(use_opd=False)
+
+    with pytest.raises(ValueError, match="requires --use-opd"):
+        assert_g2_standard_args(args)
+
+
+def test_g2_arg_validation_preserves_teacher_completion_mode():
+    args = _base_g2_arg_validation(
+        cf_target_mode="teacher",
+        teacher_backend="remote",
+        teacher_api_base="http://teacher/v1",
+        teacher_model_name="teacher",
+    )
+
+    assert_g2_standard_args(args)
+    assert uses_standard_g2_remote_teacher(args)
 
 
 def test_g2_remote_teacher_config_is_hashable_for_client_cache():

@@ -36,7 +36,7 @@ def train(args):
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     # always update weight first so that sglang has the loaded weights from training.
-    if not args.critic_train_only:
+    if not args.critic_train_only and not args.skip_initial_update_weights:
         actor_model.update_weights()
 
         if args.check_weight_update_equal:

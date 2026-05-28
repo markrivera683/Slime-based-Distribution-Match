@@ -593,16 +593,34 @@ def get_g1_embeddings_from_hidden_states(
     }
 
 
+def _resolve_opd_kl_application(args: Namespace) -> str:
+    application = str(getattr(args, "opd_kl_application", "auto"))
+    if application == "auto":
+        if (
+            getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+            and getattr(args, "cf_target_mode", None) == "opd_onpolicy"
+        ):
+            return "cf_l1oo"
+        return "token_penalty"
+    if application not in {"token_penalty", "cf_l1oo", "both"}:
+        raise ValueError(
+            f"Unsupported --opd-kl-application {application!r}; "
+            "expected auto, token_penalty, cf_l1oo, or both."
+        )
+    return application
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
 ) -> None:
-    """Apply on-policy distillation KL penalty to advantages.
+    """Compute OPD reverse-KL metrics and optionally apply token KL penalty.
 
-    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
-    to advantages in-place. This is orthogonal to the base advantage estimator.
+    In OPD-CF-L1OO mode, the teacher signal is already converted into
+    precomputed token advantages, so the default behavior records reverse-KL
+    metrics without subtracting the tokenwise KL again.
 
     Args:
         args: Configuration containing `use_opd` and `opd_kl_coef`.
@@ -627,7 +645,8 @@ def apply_opd_kl_to_advantages(
     reverse_kls = []
     for i, adv in enumerate(advantages):
         reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
+        if _resolve_opd_kl_application(args) in {"token_penalty", "both"}:
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 
     # Store reverse KL for logging

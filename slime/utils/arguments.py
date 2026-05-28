@@ -435,6 +435,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval for updating the weights",
             )
             parser.add_argument(
+                "--skip-initial-update-weights",
+                action="store_true",
+                default=False,
+                help="Skip the initial actor-to-rollout weight sync. Intended for debugging matching initial checkpoints.",
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",
@@ -1290,9 +1296,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--cf-target-mode",
                 type=str,
-                choices=["single", "teacher"],
+                choices=["single", "teacher", "opd_onpolicy"],
                 default=None,
-                help="G2 target mode. Use 'single' for no-teacher distribution matching or 'teacher' for teacher target mode.",
+                help=(
+                    "G2 target mode. Use 'single' for no-teacher distribution matching, 'teacher' for "
+                    "teacher completion target mode, or 'opd_onpolicy' for OPD-CF-L1OO over student rollouts."
+                ),
             )
             parser.add_argument(
                 "--cf-target-num-refs",
@@ -1318,6 +1327,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--cf-alpha", type=float, default=0.5, help="CF amplitude discrepancy weight for G2.")
             parser.add_argument("--cf-beta", type=float, default=0.5, help="CF phase discrepancy weight for G2.")
             parser.add_argument("--cf-reward-scale", type=float, default=1.0, help="Reward scale for G2 cf_l1oo.")
+            parser.add_argument(
+                "--opd-cf-score-temperature",
+                type=float,
+                default=1.0,
+                help="Softmax temperature for OPD-CF-L1OO teacher rollout scores.",
+            )
+            parser.add_argument(
+                "--opd-cf-score-normalization",
+                type=str,
+                choices=["mean", "sum"],
+                default="mean",
+                help="How OPD-CF-L1OO aggregates teacher token logprobs into rollout scores.",
+            )
+            parser.add_argument(
+                "--opd-credit-assignment",
+                type=str,
+                choices=["cf_l1oo", "ebft"],
+                default="cf_l1oo",
+                help=(
+                    "Credit assignment for cf-target-mode=opd_onpolicy. cf_l1oo uses CF distribution LOO; "
+                    "ebft is a pointwise EBFT-style baseline against the teacher-weighted on-policy centroid."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-application",
+                type=str,
+                choices=["auto", "token_penalty", "cf_l1oo", "both"],
+                default="auto",
+                help=(
+                    "How OPD reverse-KL is applied. auto keeps the current token penalty except "
+                    "cf-target-mode=opd_onpolicy, where reverse-KL is logged but not double-applied."
+                ),
+            )
             parser.add_argument(
                 "--cf-teacher-lambda",
                 type=float,
@@ -1832,8 +1874,10 @@ def assert_g2_standard_args(args) -> None:
         return
 
     cf_target_mode = getattr(args, "cf_target_mode", None)
-    if cf_target_mode not in {"single", "teacher"}:
-        raise ValueError("G2 requires --distribution-reward-type cf_l1oo with --cf-target-mode single or teacher.")
+    if cf_target_mode not in {"single", "teacher", "opd_onpolicy"}:
+        raise ValueError(
+            "G2 requires --distribution-reward-type cf_l1oo with --cf-target-mode single, teacher, or opd_onpolicy."
+        )
     if getattr(args, "advantage_estimator", None) != "g1":
         raise ValueError("Standard G2 currently reuses Slime's token-advantage path; set --advantage-estimator g1.")
     if getattr(args, "g1_embedding_source", "rollout") != "megatron_ref" or getattr(args, "g1_reward_location", "rollout") != "trainer":
@@ -1841,7 +1885,16 @@ def assert_g2_standard_args(args) -> None:
             "Standard G2 cf_l1oo requires trainer-side frozen critic embeddings: "
             "set --g1-embedding-source megatron_ref --g1-reward-location trainer."
         )
-    if cf_target_mode == "single":
+    if cf_target_mode == "opd_onpolicy":
+        if not getattr(args, "use_opd", False):
+            raise ValueError("OPD-CF-L1OO requires --use-opd.")
+        if int(getattr(args, "n_samples_per_prompt", 1)) <= 1:
+            raise ValueError("OPD-CF-L1OO requires --n-samples-per-prompt > 1.")
+        if float(getattr(args, "opd_cf_score_temperature", 1.0)) <= 0.0:
+            raise ValueError("--opd-cf-score-temperature must be positive.")
+        if getattr(args, "opd_credit_assignment", "cf_l1oo") not in {"cf_l1oo", "ebft"}:
+            raise ValueError("--opd-credit-assignment must be 'cf_l1oo' or 'ebft'.")
+    elif cf_target_mode == "single":
         if getattr(args, "teacher_backend", None) is not None:
             raise ValueError("G2 no-teacher distribution mode should not set --teacher-backend.")
         if getattr(args, "teacher_api_base", None) or getattr(args, "teacher_model_name", None):
@@ -1864,7 +1917,11 @@ def assert_g2_standard_args(args) -> None:
             raise ValueError("--cf-teacher-lambda must be in (0, 1] for standard G2.")
     if not bool(getattr(args, "use_whitening", False)):
         raise ValueError("Standard G2 requires --use-whitening to match OpenRLHF reward construction.")
-    if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) != "sglang":
+    if (
+        getattr(args, "use_opd", False)
+        and cf_target_mode != "opd_onpolicy"
+        and getattr(args, "opd_type", None) != "sglang"
+    ):
         raise ValueError(
             "Standard G2 cf_l1oo can only be combined with SGLang OPD teacher_log_probs; "
             "set --opd-type sglang or remove --use-opd."
