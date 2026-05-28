@@ -686,8 +686,55 @@ def test_train_data_conversion_prepares_megatron_g1_sequences_without_rollout_ad
     train_data = rollout_manager_class._convert_samples_to_train_data(manager, samples)
 
     assert "g1_token_advantages" not in train_data
+    assert "ebft_logprob_source_rows" not in train_data
+    assert "ebft_logprob_target_positions" not in train_data
+    assert "ebft_logprob_indexing" not in train_data
     assert train_data["g1_full_sequences"][0] == [1, 2, 3, 4, 0, 0, 5, 6, 5, 6]
     assert train_data["g1_qa_masks"][0] == [0, 0, 1, 1, 0, 0, 1, 1, 1, 1]
+    _assert_megatron_g1_rollout_contract(train_data, samples, manager.args)
+
+
+def test_train_data_conversion_prepares_strict_ebft_logprob_metadata(monkeypatch):
+    from slime.utils import processing_utils
+
+    monkeypatch.setattr(processing_utils, "load_tokenizer", lambda *args, **kwargs: _FakeTokenizer())
+    rollout_manager_class = getattr(getattr(RolloutManager, "__ray_metadata__", None), "modified_class", RolloutManager)
+    manager = object.__new__(rollout_manager_class)
+    manager.args = Namespace(
+        reward_key=None,
+        advantage_estimator="g1",
+        rewards_normalization=False,
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        g1_tokenizer_path="unused",
+        hf_checkpoint="unused",
+        g1_prompt_length=6,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_response_length=4,
+        n_samples_per_prompt=2,
+        g1_openrlhf_repo="/unused",
+        g1_hidden_state_method="last_only",
+        g1_embedding_device="cuda",
+        g1_embedding_dtype="bfloat16",
+        g1_qa_masking=False,
+        g1_document_masking=False,
+        g1_use_ebft_loss=True,
+        g1_ebft_logprob_indexing="strict_block_source",
+    )
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = None
+    samples = [
+        Sample(index=0, prompt="ab", label="cd", tokens=[1, 2, 5, 6, 5, 6], response_length=4, reward=0.0),
+        Sample(index=1, prompt="ab", label="cd", tokens=[1, 2, 6, 5, 6, 5], response_length=4, reward=0.0),
+    ]
+
+    train_data = rollout_manager_class._convert_samples_to_train_data(manager, samples)
+
+    assert train_data["ebft_logprob_indexing"] == "strict_block_source"
+    assert train_data["ebft_logprob_source_rows"] == [[0, 1, 2, 3, 4, 1, 3, 6, 7]] * 2
+    assert train_data["ebft_logprob_target_positions"] == [[1, 2, 3, 4, 5, 6, 7, 8, 9]] * 2
     _assert_megatron_g1_rollout_contract(train_data, samples, manager.args)
 
 
@@ -981,6 +1028,9 @@ def test_split_train_data_by_dp_preserves_g1_token_advantages(monkeypatch):
         "g1_token_advantages": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]],
         "g1_full_sequences": [[1, 2], [3, 4], [5, 6], [7, 8]],
         "g1_qa_masks": [[1, 1], [1, 1], [1, 1], [1, 1]],
+        "ebft_logprob_source_rows": [[0, 1], [1, 2], [2, 3], [3, 4]],
+        "ebft_logprob_target_positions": [[1, 2], [2, 3], [3, 4], [4, 5]],
+        "ebft_logprob_indexing": "strict_block_source",
     }
 
     refs = rollout_manager_class._split_train_data_by_dp(manager, data, dp_size=2)
@@ -989,6 +1039,45 @@ def test_split_train_data_by_dp_preserves_g1_token_advantages(monkeypatch):
     assert refs[1].inner["g1_token_advantages"] == [[0.3, 0.4], [0.7, 0.8]]
     assert refs[0].inner["g1_full_sequences"] == [[1, 2], [5, 6]]
     assert refs[1].inner["g1_qa_masks"] == [[1, 1], [1, 1]]
+    assert refs[0].inner["ebft_logprob_source_rows"] == [[0, 1], [2, 3]]
+    assert refs[1].inner["ebft_logprob_target_positions"] == [[2, 3], [4, 5]]
+    assert refs[0].inner["ebft_logprob_indexing"] == "strict_block_source"
+    assert refs[1].inner["ebft_logprob_indexing"] == "strict_block_source"
+
+
+def test_data_iterator_preserves_strict_ebft_metadata_scalar_and_rows():
+    data = {
+        "tokens": [[1], [2], [3]],
+        "ebft_logprob_source_rows": [[0, 1], [2, 3], [4, 5]],
+        "ebft_logprob_target_positions": [[1, 2], [3, 4], [5, 6]],
+        "ebft_logprob_indexing": "strict_block_source",
+    }
+    iterator = data_module.DataIterator(data, micro_batch_size=2)
+
+    batch = iterator.get_next(
+        [
+            "tokens",
+            "ebft_logprob_source_rows",
+            "ebft_logprob_target_positions",
+            "ebft_logprob_indexing",
+        ]
+    )
+
+    assert batch["ebft_logprob_source_rows"] == [[0, 1], [2, 3]]
+    assert batch["ebft_logprob_target_positions"] == [[1, 2], [3, 4]]
+    assert batch["ebft_logprob_indexing"] == "strict_block_source"
+
+
+def test_training_batch_keys_request_strict_ebft_metadata():
+    model_source = (Path(__file__).resolve().parents[1] / "slime/backends/megatron_utils/model.py").read_text(
+        encoding="utf-8"
+    )
+    guard_idx = model_source.index('getattr(args, "g1_use_ebft_loss", False)')
+    batch_key_block = model_source[guard_idx : guard_idx + 360]
+
+    assert '"ebft_logprob_source_rows"' in batch_key_block
+    assert '"ebft_logprob_target_positions"' in batch_key_block
+    assert '"ebft_logprob_indexing"' in batch_key_block
 
 
 def test_split_train_data_by_dp_keeps_megatron_g1_prompt_groups_together(monkeypatch):
@@ -1120,6 +1209,9 @@ def test_log_rollout_data_skips_g1_integer_payloads(monkeypatch):
         "rewards": [1.0],
         "g1_full_sequences": [torch.tensor([1, 2, 3, 4], dtype=torch.long)],
         "g1_qa_masks": [torch.tensor([0, 1, 1, 1], dtype=torch.long)],
+        "ebft_logprob_source_rows": [[0, 1, 2]],
+        "ebft_logprob_target_positions": [[1, 2, 3]],
+        "ebft_logprob_indexing": "strict_block_source",
     }
 
     data_module.log_rollout_data(

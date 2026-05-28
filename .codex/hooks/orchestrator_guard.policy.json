@@ -1,0 +1,36 @@
+{
+  "source": ".claude/settings.json",
+  "status": "advisory-unless-wrapped",
+  "codex_support_note": "Codex does not currently auto-load this repository-local hook policy. Use the script path below from an external wrapper or future hook integration if strict enforcement is desired.",
+  "hook_event": "PreToolUse",
+  "matcher": "Read|Edit|MultiEdit|Write|NotebookEdit|Bash|Grep|Glob|LS",
+  "command": "python3 .codex/hooks/orchestrator_guard.py",
+  "strict_mode": {
+    "enabled_when": {
+      "ORCHESTRATOR_GUARD_STRICT": "1"
+    },
+    "role_environment_variables": [
+      "SLIME_AGENT_ROLE",
+      "CODEX_AGENT_ROLE"
+    ],
+    "allowed_roles": [
+      "subagent",
+      "investigator",
+      "implementer",
+      "implementation",
+      "verifier",
+      "tester"
+    ]
+  },
+  "monitored_tools": [
+    "Read",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "NotebookEdit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "LS"
+  ]
+}

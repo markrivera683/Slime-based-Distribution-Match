@@ -8,6 +8,18 @@ This is a Python training framework centered on `slime/`. Core distributed train
 
 The G1/G2/G3 training line in this repo descends from EBFT / DMFT research code, not from generic RLHF alone. Read `dmft_agent_brief.md` before changing G2, `cf_l1oo`, OPD, teacher-target, or feature-embedding logic. The source reference repo is `/mnt/data/ebft-distribution-new/code`, especially `scripts/diff_dataset/` and `openrlhf/trainer/ppo_utils/ebft_experience_maker.py`.
 
+## Orchestrator/Subagent Operating Contract
+
+Every agent must identify whether it is acting as the root orchestrator or as a delegated subagent before doing work.
+
+- The root orchestrator talks with the user, verifies scope and assumptions with the user, and summarizes delegated results back to the user.
+- The root orchestrator does not inspect source code or write repository code directly. Its job is coordination, verification, and conversation with the user.
+- The root orchestrator must delegate code inspection and code-writing work to multiple subagents whenever implementation work is needed.
+- Use at least one read-only investigator subagent for code inspection and at least one implementation subagent for scoped edits. Use a separate verifier/test subagent when the change can be independently checked.
+- Delegated subagents may inspect or edit code only inside the explicit scope given by the orchestrator. Each delegation should state the role, allowed files or areas, allowed operations, and expected report format.
+- If no subagent mechanism is available in the current session, the orchestrator must pause and tell the user it cannot inspect or edit code under this contract.
+- The orchestrator must not imply it personally inspected or edited code. It should report which subagent did the work, what was verified, and what still needs user confirmation.
+
 ## Build, Test, and Development Commands
 
 - `pip install -e .`: install the package in editable mode.

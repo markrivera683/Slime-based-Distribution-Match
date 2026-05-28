@@ -12,9 +12,17 @@ from pathlib import Path
 
 import torch
 
+from slime.utils.g1_core import get_num_strided_blocks
+
 
 G1_EBFT_ACTOR_LOSS_DUMP_ENV = "G1_EBFT_ACTOR_LOSS_DUMP_PATH"
 G1_EBFT_ACTOR_LOSS_DUMP_FORMAT = "slime_g1_ebft_actor_loss_runtime_v1"
+G1_EBFT_LOGPROB_INDEXING_STANDARD = "standard_next_token"
+G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK = "strict_block_source"
+G1_EBFT_LOGPROB_INDEXING_CHOICES = (
+    G1_EBFT_LOGPROB_INDEXING_STANDARD,
+    G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK,
+)
 
 
 def openrlhf_masked_mean(
@@ -130,6 +138,120 @@ def build_ebft_g1_next_token_tensors(
         prompt_length=int(g1_prompt_length),
         response_length=int(g1_response_length),
     )
+
+
+def build_strict_block_source_target_pairs(
+    *,
+    prompt_length: int,
+    context_length: int,
+    generate_length: int,
+    stride: int,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return OpenRLHF EBFT source rows and target positions for generated tokens.
+
+    OpenRLHF block prediction uses boundary logits for the first generated step:
+    ``context_length + block_idx * stride - 1``. Later steps use the previous
+    generated token of the same block. Returned tensors are sample-local
+    positions in the full ``prompt + response`` sequence.
+    """
+
+    prompt_length = int(prompt_length)
+    context_length = int(context_length)
+    generate_length = int(generate_length)
+    stride = int(stride)
+    if context_length < 1:
+        raise ValueError(f"context_length must be >= 1 for strict EBFT block source rows, got {context_length}")
+
+    num_blocks = get_num_strided_blocks(
+        prompt_length=prompt_length,
+        context_length=context_length,
+        generate_length=generate_length,
+        stride=stride,
+    )
+    source_rows: list[int] = []
+    target_positions: list[int] = []
+    for step_idx in range(generate_length):
+        for block_idx in range(num_blocks):
+            response_idx = step_idx * num_blocks + block_idx
+            if step_idx == 0:
+                source = context_length + block_idx * stride - 1
+            else:
+                source = prompt_length + (step_idx - 1) * num_blocks + block_idx
+            source_rows.append(source)
+            target_positions.append(prompt_length + response_idx)
+
+    return (
+        torch.tensor(source_rows, dtype=torch.long, device=device),
+        torch.tensor(target_positions, dtype=torch.long, device=device),
+    )
+
+
+def build_ebft_g1_logprob_pair_axis(
+    *,
+    prompt_length: int,
+    response_length: int,
+    context_length: int,
+    generate_length: int,
+    stride: int,
+    indexing: str = G1_EBFT_LOGPROB_INDEXING_STANDARD,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build pair-axis ``(source_logit_row, target_token_pos, action_mask)`` tensors.
+
+    ``standard_next_token`` is the existing Slime behavior: row ``i`` predicts
+    token ``i + 1``. ``strict_block_source`` matches OpenRLHF EBFT's processed
+    logits: prompt CE pairs remain standard, while generated/action pairs gather
+    logits from the block-prediction source rows.
+    """
+
+    prompt_length = int(prompt_length)
+    response_length = int(response_length)
+    context_length = int(context_length)
+    generate_length = int(generate_length)
+    stride = int(stride)
+    if indexing not in G1_EBFT_LOGPROB_INDEXING_CHOICES:
+        raise ValueError(f"Unsupported G1 EBFT logprob indexing: {indexing!r}")
+    if prompt_length < 1:
+        raise ValueError(f"prompt_length must be >= 1, got {prompt_length}")
+    if response_length < 0:
+        raise ValueError(f"response_length must be >= 0, got {response_length}")
+
+    total_length = prompt_length + response_length
+    target_positions = torch.arange(1, total_length, dtype=torch.long, device=device)
+    source_rows = torch.arange(0, total_length - 1, dtype=torch.long, device=device)
+    action_mask = torch.zeros(total_length - 1, dtype=torch.bool, device=device)
+    if response_length:
+        action_start = prompt_length - 1
+        action_end = action_start + response_length
+        action_mask[action_start:action_end] = True
+
+    if indexing == G1_EBFT_LOGPROB_INDEXING_STANDARD or response_length == 0:
+        return source_rows, target_positions, action_mask
+
+    num_blocks = get_num_strided_blocks(
+        prompt_length=prompt_length,
+        context_length=context_length,
+        generate_length=generate_length,
+        stride=stride,
+    )
+    expected_response_length = int(generate_length) * int(num_blocks)
+    if response_length != expected_response_length:
+        raise ValueError(
+            "strict_block_source requires response_length == generate_length * num_blocks "
+            f"({response_length} != {generate_length} * {num_blocks})"
+        )
+
+    action_sources, action_targets = build_strict_block_source_target_pairs(
+        prompt_length=prompt_length,
+        context_length=context_length,
+        generate_length=generate_length,
+        stride=stride,
+        device=device,
+    )
+    source_rows[action_start:action_end] = action_sources
+    target_positions[action_start:action_end] = action_targets
+    return source_rows, target_positions, action_mask
 
 
 def ebft_compute_rl_ce_scalars_after_masks(

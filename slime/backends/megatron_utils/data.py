@@ -23,6 +23,23 @@ from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 logger = logging.getLogger(__name__)
 
 
+def prepare_g1_ebft_tokens_for_batch(batch: dict, args: Namespace | None) -> None:
+    """Use G1 full sequences as model input for strict EBFT actor loss batches."""
+
+    if args is None or not bool(getattr(args, "g1_use_ebft_loss", False)):
+        return
+    if getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "strict_block_source":
+        return
+
+    g1_full_sequences = batch.get("g1_full_sequences")
+    if g1_full_sequences is None:
+        return
+
+    batch["tokens"] = g1_full_sequences
+    batch["total_lengths"] = [int(seq.reshape(-1).numel()) for seq in g1_full_sequences]
+    batch["response_lengths"] = [int(getattr(args, "g1_response_length"))] * len(g1_full_sequences)
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -59,6 +76,8 @@ def get_batch(
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
+
+    prepare_g1_ebft_tokens_for_batch(batch, args)
 
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
@@ -272,6 +291,8 @@ class DataIterator:
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
+            elif key == "ebft_logprob_indexing":
+                batch[key] = vals
             else:
                 if self.micro_batch_indices is not None:
                     indices = self.micro_batch_indices[self.offset]
@@ -425,6 +446,9 @@ def log_rollout_data(
                 "dynamic_global_batch_size",
                 "g1_full_sequences",
                 "g1_qa_masks",
+                "ebft_logprob_source_rows",
+                "ebft_logprob_target_positions",
+                "ebft_logprob_indexing",
                 "g2_teacher_gen_embeddings",
                 "g2_teacher_full_sequences",
                 "g2_teacher_qa_masks",

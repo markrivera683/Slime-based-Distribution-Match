@@ -22,6 +22,10 @@ from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
+from slime.utils.g1_ebft_loss import (
+    G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK,
+    build_ebft_g1_logprob_pair_axis,
+)
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -34,6 +38,38 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _attach_strict_ebft_logprob_metadata(args: Any, train_data: dict[str, Any]) -> None:
+    if not bool(getattr(args, "g1_use_ebft_loss", False)):
+        return
+    if getattr(args, "g1_ebft_logprob_indexing", None) != G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK:
+        return
+    if "g1_full_sequences" not in train_data:
+        return
+
+    source_rows = []
+    target_positions = []
+    for full_sequence, response_length in zip(
+        train_data["g1_full_sequences"],
+        train_data["response_lengths"],
+        strict=True,
+    ):
+        total_length = len(full_sequence)
+        rows, positions, _ = build_ebft_g1_logprob_pair_axis(
+            prompt_length=total_length - int(response_length),
+            response_length=int(response_length),
+            context_length=int(getattr(args, "g1_context_length", 8)),
+            generate_length=int(getattr(args, "g1_generate_length", 8)),
+            stride=int(getattr(args, "g1_stride", 8)),
+            indexing=G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK,
+        )
+        source_rows.append(rows.tolist())
+        target_positions.append(positions.tolist())
+
+    train_data["ebft_logprob_source_rows"] = source_rows
+    train_data["ebft_logprob_target_positions"] = target_positions
+    train_data["ebft_logprob_indexing"] = G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK
 
 
 @dataclasses.dataclass
@@ -834,6 +870,7 @@ class RolloutManager:
                         teacher_qa_masks[idx] = mask_list
             train_data["g1_full_sequences"] = full_sequences
             train_data["g1_qa_masks"] = qa_masks
+            _attach_strict_ebft_logprob_metadata(self.args, train_data)
             if use_g2_trainer_teacher:
                 train_data["g2_teacher_full_sequences"] = teacher_full_sequences
                 train_data["g2_teacher_qa_masks"] = teacher_qa_masks
@@ -922,6 +959,8 @@ class RolloutManager:
                 "g1_token_advantages",
                 "g1_full_sequences",
                 "g1_qa_masks",
+                "ebft_logprob_source_rows",
+                "ebft_logprob_target_positions",
             ]:
                 if key not in data:
                     continue
@@ -931,6 +970,7 @@ class RolloutManager:
             for key in [
                 "raw_reward",
                 "total_lengths",
+                "ebft_logprob_indexing",
             ]:
                 if key not in data:
                     continue

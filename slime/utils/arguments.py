@@ -1496,6 +1496,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--g1-ebft-logprob-indexing",
+                type=str,
+                choices=["standard_next_token", "strict_block_source"],
+                default="standard_next_token",
+                help=(
+                    "Logit-row indexing for --g1-use-ebft-loss. 'standard_next_token' keeps the existing "
+                    "row i -> token i+1 gather. 'strict_block_source' gathers generated/action log-probs from "
+                    "OpenRLHF EBFT block-prediction source rows while keeping the EBFT RL/CE masks target-aligned."
+                ),
+            )
+            parser.add_argument(
                 "--g1-megatron-ref-forward-mode",
                 type=str,
                 choices=["standard", "openrlhf_exact"],
@@ -2094,6 +2105,22 @@ def slime_validate_args(args):
             raise ValueError("--g1-use-ebft-loss is incompatible with --use-opsm")
         if getattr(args, "use_tis", False) or getattr(args, "get_mismatch_metrics", False):
             raise ValueError("--g1-use-ebft-loss is incompatible with --use-tis / --get-mismatch-metrics")
+        if getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") == "strict_block_source":
+            remainder = int(args.g1_prompt_length) - int(args.g1_generate_length) - int(args.g1_context_length)
+            if remainder < 0 or remainder % int(args.g1_stride) != 0:
+                raise ValueError(
+                    "--g1-ebft-logprob-indexing strict_block_source requires valid G1 strided-block geometry"
+                )
+            num_blocks = remainder // int(args.g1_stride) + 1
+            expected_response_length = int(args.g1_generate_length) * num_blocks
+            if int(args.g1_response_length) != expected_response_length:
+                raise ValueError(
+                    "--g1-ebft-logprob-indexing strict_block_source requires "
+                    "g1_response_length == g1_generate_length * num_blocks "
+                    f"({args.g1_response_length} != {args.g1_generate_length} * {num_blocks})"
+                )
+    elif getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "standard_next_token":
+        raise ValueError("--g1-ebft-logprob-indexing strict_block_source requires --g1-use-ebft-loss")
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
