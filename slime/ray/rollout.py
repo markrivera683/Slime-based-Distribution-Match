@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import ray
+import requests
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
@@ -21,6 +22,10 @@ from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
+from slime.utils.g1_ebft_loss import (
+    G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK,
+    build_ebft_g1_logprob_pair_axis,
+)
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -33,6 +38,38 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _attach_strict_ebft_logprob_metadata(args: Any, train_data: dict[str, Any]) -> None:
+    if not bool(getattr(args, "g1_use_ebft_loss", False)):
+        return
+    if getattr(args, "g1_ebft_logprob_indexing", None) != G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK:
+        return
+    if "g1_full_sequences" not in train_data:
+        return
+
+    source_rows = []
+    target_positions = []
+    for full_sequence, response_length in zip(
+        train_data["g1_full_sequences"],
+        train_data["response_lengths"],
+        strict=True,
+    ):
+        total_length = len(full_sequence)
+        rows, positions, _ = build_ebft_g1_logprob_pair_axis(
+            prompt_length=total_length - int(response_length),
+            response_length=int(response_length),
+            context_length=int(getattr(args, "g1_context_length", 8)),
+            generate_length=int(getattr(args, "g1_generate_length", 8)),
+            stride=int(getattr(args, "g1_stride", 8)),
+            indexing=G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK,
+        )
+        source_rows.append(rows.tolist())
+        target_positions.append(positions.tolist())
+
+    train_data["ebft_logprob_source_rows"] = source_rows
+    train_data["ebft_logprob_target_positions"] = target_positions
+    train_data["ebft_logprob_indexing"] = G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK
 
 
 @dataclasses.dataclass
@@ -833,6 +870,7 @@ class RolloutManager:
                         teacher_qa_masks[idx] = mask_list
             train_data["g1_full_sequences"] = full_sequences
             train_data["g1_qa_masks"] = qa_masks
+            _attach_strict_ebft_logprob_metadata(self.args, train_data)
             if use_g2_trainer_teacher:
                 train_data["g2_teacher_full_sequences"] = teacher_full_sequences
                 train_data["g2_teacher_qa_masks"] = teacher_qa_masks
@@ -921,6 +959,8 @@ class RolloutManager:
                 "g1_token_advantages",
                 "g1_full_sequences",
                 "g1_qa_masks",
+                "ebft_logprob_source_rows",
+                "ebft_logprob_target_positions",
             ]:
                 if key not in data:
                     continue
@@ -930,6 +970,7 @@ class RolloutManager:
             for key in [
                 "raw_reward",
                 "total_lengths",
+                "ebft_logprob_indexing",
             ]:
                 if key not in data:
                     continue
@@ -1082,6 +1123,10 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
     # We will not use the health check from router.
     router_args.disable_health_check = True
+    if getattr(args, "router_disable_circuit_breaker", False) or os.environ.get(
+        "SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER", "true"
+    ).lower() in {"1", "true", "yes", "on"}:
+        router_args.disable_circuit_breaker = True
 
     logger.info(f"Launch router with args: {router_args}")
 
@@ -1096,6 +1141,44 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     assert process.is_alive()
     logger.info(f"Router launched at {router_ip}:{router_port}, Prometheus port: {router_args.prometheus_port}")
     return router_ip, router_port
+
+
+def _wait_router_workers(args, router_ip: str | None, router_port: int | None, expected_workers: int) -> None:
+    if not router_ip or not router_port or expected_workers <= 0:
+        return
+
+    timeout = float(os.environ.get("SLIME_ROUTER_WORKER_WAIT_TIMEOUT", "600"))
+    interval = float(os.environ.get("SLIME_ROUTER_WORKER_WAIT_INTERVAL", "2"))
+    url = f"http://{router_ip}:{router_port}/workers"
+    deadline = time.monotonic() + timeout
+    last_error = "not checked yet"
+
+    with requests.Session() as session:
+        session.trust_env = False
+        while time.monotonic() < deadline:
+            try:
+                response = session.get(url, timeout=float(os.environ.get("SLIME_ROUTER_WORKER_REQUEST_TIMEOUT", "10")))
+                response.raise_for_status()
+                data = response.json()
+                workers = data.get("workers", data if isinstance(data, list) else [])
+                if isinstance(workers, list) and len(workers) >= expected_workers:
+                    logger.info(
+                        "Router has %s/%s registered workers at %s",
+                        len(workers),
+                        expected_workers,
+                        url,
+                    )
+                    return
+                last_error = f"workers={workers}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+
+            time.sleep(interval)
+
+    raise TimeoutError(
+        f"Timed out after {timeout:.1f}s waiting for {expected_workers} registered SGLang workers "
+        f"at {url}; last_error={last_error}"
+    )
 
 
 def _compute_rollout_offset(args) -> int:
@@ -1149,10 +1232,16 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        direct_worker_mode = getattr(args, "sglang_direct_worker_mode", False)
+        if direct_worker_mode:
+            if has_pd or model_cfg.has_encoder_disaggregation:
+                raise ValueError("--sglang-direct-worker-mode only supports a single regular SGLang worker group.")
+            router_ip, router_port = None, None
+        else:
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
         # Write back for backward compat (first model only).
-        if model_idx == 0:
+        if model_idx == 0 and not direct_worker_mode:
             args.sglang_router_ip = router_ip
             args.sglang_router_port = router_port
 
@@ -1243,6 +1332,16 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             if all_init_handles:
                 ray.get(all_init_handles)
 
+        regular_worker_urls = [
+            url
+            for group in server_groups
+            if group.worker_type == "regular"
+            for url in ray.get([engine.get_url.remote() for engine in group.engines])
+            if url is not None
+        ]
+        if not direct_worker_mode:
+            _wait_router_workers(args, router_ip, router_port, len(regular_worker_urls))
+
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,
             router_ip=router_ip,
@@ -1250,6 +1349,23 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             model_name=model_cfg.name,
             update_weights=model_cfg.update_weights,
         )
+        if direct_worker_mode:
+            if len(regular_worker_urls) != 1:
+                raise ValueError(
+                    f"--sglang-direct-worker-mode expects exactly one regular worker, got {regular_worker_urls}"
+                )
+            worker_url = regular_worker_urls[0].removeprefix("http://")
+            worker_host, worker_port = worker_url.rsplit(":", 1)
+            servers[model_cfg.name].router_ip = worker_host
+            servers[model_cfg.name].router_port = int(worker_port)
+            logger.warning(
+                "Direct SGLang worker mode is enabled; rollout requests for %s go to %s",
+                model_cfg.name,
+                regular_worker_urls[0],
+            )
+            if model_idx == 0:
+                args.sglang_router_ip = worker_host
+                args.sglang_router_port = int(worker_port)
 
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}

@@ -6,6 +6,16 @@ from slime.utils.logging_utils import configure_logger, finish_tracking, init_tr
 from slime.utils.misc import should_run_periodic_action
 
 
+def _effopd_requires_weight_sync(train_results) -> bool:
+    for result in train_results or []:
+        if not isinstance(result, dict):
+            continue
+        effopd = result.get("effopd")
+        if isinstance(effopd, dict) and effopd.get("force_weight_sync"):
+            return True
+    return False
+
+
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
@@ -26,7 +36,7 @@ def train(args):
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     # always update weight first so that sglang has the loaded weights from training.
-    if not args.critic_train_only:
+    if not args.critic_train_only and not args.skip_initial_update_weights:
         actor_model.update_weights()
 
         if args.check_weight_update_equal:
@@ -43,13 +53,14 @@ def train(args):
         if rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
+        actor_train_results = []
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if rollout_id >= args.num_critic_only_steps and not args.critic_train_only:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+                actor_train_results = ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
             ray.get(critic_train_handle)
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            actor_train_results = ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             if not args.critic_train_only:
@@ -65,7 +76,19 @@ def train(args):
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
 
-        if (rollout_id + 1) % args.update_weights_interval == 0:
+        effopd_force_sync = _effopd_requires_weight_sync(actor_train_results)
+        did_update_weights = False
+        if effopd_force_sync:
+            if rollout_data_next_future is not None:
+                ray.cancel(rollout_data_next_future, force=True)
+                rollout_data_next_future = None
+            if not args.critic_train_only:
+                actor_model.update_weights()
+                did_update_weights = True
+            if rollout_id + 1 < args.num_rollout:
+                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+
+        if (rollout_id + 1) % args.update_weights_interval == 0 and not did_update_weights:
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None

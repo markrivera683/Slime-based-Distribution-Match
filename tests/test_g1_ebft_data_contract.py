@@ -85,7 +85,14 @@ def test_qa_masking_off_matches_openrlhf_ones():
 
 
 def test_maybe_attach_populates_lists():
-    ns = Namespace(g1_use_ebft_loss=True, g1_prompt_length=384, g1_response_length=376)
+    ns = Namespace(
+        g1_use_ebft_loss=True,
+        g1_prompt_length=384,
+        g1_response_length=376,
+        g1_context_length=8,
+        g1_generate_length=8,
+        g1_stride=8,
+    )
     pl, rl = 384, 376
     L = pl + rl
     batch = {
@@ -95,15 +102,129 @@ def test_maybe_attach_populates_lists():
     }
     attach_ebft_g1_next_token_contract_to_batch(batch, ns)
     assert "ebft_action_mask_next" in batch
+    assert "ebft_logprob_source_rows" in batch
+    assert "ebft_logprob_target_positions" in batch
     assert len(batch["ebft_action_mask_next"]) == 2
     assert batch["ebft_action_mask_next"][0].shape == (L - 1,)
     assert batch["ebft_qa_mask_next"][0].shape == (L - 1,)
     assert batch["ebft_advantages_next"][0].shape == (L - 1,)
     assert batch["ebft_seq_len_m1"] == [L - 1, L - 1]
+    assert batch["ebft_logprob_indexing"] == "standard_next_token"
+    torch.testing.assert_close(batch["ebft_logprob_source_rows"][0], torch.arange(L - 1))
+    torch.testing.assert_close(batch["ebft_logprob_target_positions"][0], torch.arange(1, L))
     assert batch["ebft_action_mask_next"][0].sum().item() == rl
     assert not batch["ebft_action_mask_next"][0][: pl - 1].any()
     assert batch["ebft_action_mask_next"][0][pl - 1 : pl - 1 + rl].all()
     torch.testing.assert_close(batch["ebft_advantages_next"][1][pl - 1 : pl - 1 + rl], batch["advantages"][1])
+
+
+def test_attach_strict_block_source_pair_axis_preserves_duplicate_source_rows():
+    ns = Namespace(
+        g1_use_ebft_loss=True,
+        g1_prompt_length=6,
+        g1_response_length=4,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_qa_masking=True,
+        g1_ebft_logprob_indexing="strict_block_source",
+    )
+    batch = {
+        "advantages": [torch.ones(4)],
+        "response_lengths": [4],
+        "total_lengths": [10],
+        "g1_full_sequences": [torch.arange(10, dtype=torch.long)],
+        "g1_qa_masks": [torch.ones(10, dtype=torch.long)],
+    }
+    attach_ebft_g1_next_token_contract_to_batch(batch, ns)
+
+    torch.testing.assert_close(batch["ebft_logprob_source_rows"][0], torch.tensor([0, 1, 2, 3, 4, 1, 3, 6, 7]))
+    torch.testing.assert_close(batch["ebft_logprob_target_positions"][0], torch.arange(1, 10))
+    torch.testing.assert_close(
+        batch["ebft_action_mask_next"][0],
+        torch.tensor([False, False, False, False, False, True, True, True, True]),
+    )
+    assert batch["ebft_logprob_indexing"] == "strict_block_source"
+
+
+def test_attach_strict_block_source_preserves_rollout_pair_metadata():
+    ns = Namespace(
+        g1_use_ebft_loss=True,
+        g1_prompt_length=6,
+        g1_response_length=4,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_qa_masking=True,
+        g1_ebft_logprob_indexing="strict_block_source",
+    )
+    rollout_source_rows = [torch.tensor([4, 3, 2, 1, 0, 1, 3, 6, 7])]
+    rollout_target_positions = [torch.arange(1, 10)]
+    batch = {
+        "advantages": [torch.ones(4)],
+        "response_lengths": [4],
+        "total_lengths": [10],
+        "g1_full_sequences": [torch.arange(10, dtype=torch.long)],
+        "g1_qa_masks": [torch.ones(10, dtype=torch.long)],
+        "ebft_logprob_source_rows": rollout_source_rows,
+        "ebft_logprob_target_positions": rollout_target_positions,
+        "ebft_logprob_indexing": "strict_block_source",
+    }
+
+    attach_ebft_g1_next_token_contract_to_batch(batch, ns)
+
+    torch.testing.assert_close(batch["ebft_logprob_source_rows"][0], rollout_source_rows[0])
+    torch.testing.assert_close(batch["ebft_logprob_target_positions"][0], rollout_target_positions[0])
+    assert batch["ebft_logprob_indexing"] == "strict_block_source"
+
+
+def test_attach_strict_block_source_rejects_indexing_metadata_mismatch():
+    ns = Namespace(
+        g1_use_ebft_loss=True,
+        g1_prompt_length=6,
+        g1_response_length=4,
+        g1_context_length=2,
+        g1_generate_length=2,
+        g1_stride=2,
+        g1_qa_masking=True,
+        g1_ebft_logprob_indexing="strict_block_source",
+    )
+    batch = {
+        "advantages": [torch.ones(4)],
+        "response_lengths": [4],
+        "total_lengths": [10],
+        "g1_full_sequences": [torch.arange(10, dtype=torch.long)],
+        "g1_qa_masks": [torch.ones(10, dtype=torch.long)],
+        "ebft_logprob_source_rows": [torch.tensor([0, 1, 2, 3, 4, 1, 3, 6, 7])],
+        "ebft_logprob_target_positions": [torch.arange(1, 10)],
+        "ebft_logprob_indexing": "standard_next_token",
+    }
+
+    with pytest.raises(ValueError, match="does not match args"):
+        attach_ebft_g1_next_token_contract_to_batch(batch, ns)
+
+
+def test_attach_strict_block_source_rejects_invalid_geometry():
+    ns = Namespace(
+        g1_use_ebft_loss=True,
+        g1_prompt_length=6,
+        g1_response_length=4,
+        g1_context_length=2,
+        g1_generate_length=3,
+        g1_stride=2,
+        g1_qa_masking=True,
+        g1_ebft_logprob_indexing="strict_block_source",
+    )
+    batch = {
+        "advantages": [torch.ones(4)],
+        "response_lengths": [4],
+        "total_lengths": [10],
+        "g1_full_sequences": [torch.arange(10, dtype=torch.long)],
+        "g1_qa_masks": [torch.ones(10, dtype=torch.long)],
+    }
+
+    with pytest.raises(ValueError, match="Invalid G1 strided-block geometry"):
+        attach_ebft_g1_next_token_contract_to_batch(batch, ns)
 
 
 def test_build_rejects_length_mismatch():

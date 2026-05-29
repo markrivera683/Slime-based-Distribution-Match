@@ -37,6 +37,12 @@ def add_sglang_arguments(parser):
     parser = add_sglang_router_arguments(parser)
     parser.set_defaults(router_balance_abs_threshold=10, router_balance_rel_threshold=1.2)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument(
+        "--sglang-direct-worker-mode",
+        action="store_true",
+        default=False,
+        help="Route rollout requests directly to the first SGLang worker. Intended for single-worker debugging.",
+    )
 
     old_add_argument = parser.add_argument
 

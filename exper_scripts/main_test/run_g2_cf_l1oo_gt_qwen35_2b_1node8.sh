@@ -1,23 +1,14 @@
 #!/usr/bin/env bash
-# Full standalone G2 + OPD Slime/Megatron run for Qwen3.5-2B.
+# Full standalone G2 CF-L1OO-GT Slime/Megatron run for Qwen3.5-2B.
 #
-# Deployment layouts:
-#   single_node  - teacher + student on one machine (teacher started separately)
-#   two_node     - teacher node 8 GPU + student node 8 GPU (recommended for main)
+# This is the no-distillation control:
+#   - cf_l1oo distribution reward is enabled
+#   - target mode is single GT feature distribution
+#   - no OPD / no teacher logprob distillation
+#   - no teacher completion target distribution
 #
-# Two-node (teacher 1x8 GPU, student 1x8 GPU) — one orchestrator:
-#   bash exper_scripts/main_test/run_g2_opd_qwen35_2b_2node.sh
-# Or manually:
-#   bash exper_scripts/main_test/start_g2_sglang_teacher_2node.sh   # teacher node
-#   TEACHER_HOST=<ip> bash exper_scripts/main_test/run_g2_opd_qwen35_2b_main_2node_student.sh
-#
-# Single-node / explicit API base:
-#   TEACHER_API_BASE=http://127.0.0.1:30000 \
-#   TEACHER_MODEL_NAME=qwen3.5-27b \
-#   bash exper_scripts/main_test/run_g2_opd_qwen35_2b_main.sh
-#
-# OPD_TEACHER_RM_URL defaults to ${TEACHER_API_BASE%/}/generate and can be
-# overridden when the OPD log-prob endpoint is hosted separately.
+# Default layout on one 8-GPU node:
+#   actor 2 GPU + critic/ref 2 GPU + rollout 4 GPU
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +17,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # 0. Runtime paths
 # ---------------------------------------------------------------------------
 SLIME_ROOT="${SLIME_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-EBFT_DEPS_ROOT="${EBFT_DEPS_ROOT:-${EBFT_ROOT:-${SLIME_ROOT}}}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SLIME_ROOT}/../.." && pwd)}"
 MEGATRON_PATH="${MEGATRON_PATH:-/root/slime_runtime/Megatron-LM}"
 SLIME_ENV_FILE="${SLIME_ENV_FILE:-/root/slime_runtime/slime_env.sh}"
 PYTHON_BIN="${PYTHON_BIN:-/root/venvs/slime/bin/python}"
@@ -38,7 +29,8 @@ RAY_BIN="${RAY_BIN:-$(dirname "${PYTHON_BIN}")/ray}"
 MODEL_PATH="${MODEL_PATH:-/mnt/data/models/Qwen3.5-2B}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_PATH}}"
 REF_LOAD="${REF_LOAD:-/mnt/data/models/Megatron_convert_models/Qwen3.5-2B_torch_dist}"
-PREPARED_DATA_DIR="${PREPARED_DATA_DIR:-/mnt/data/ebft-distribution-new/outputs/diff_dataset_prepared}"
+SLIME_DATA_ROOT="${SLIME_DATA_ROOT:-${PROJECT_ROOT}/data}"
+PREPARED_DATA_DIR="${PREPARED_DATA_DIR:-${SLIME_DATA_ROOT}/diff_dataset_prepared}"
 SLIME_TRAIN_DATA="${SLIME_TRAIN_DATA:-${PREPARED_DATA_DIR}/opencodeinstruct_slime_qa_100k.jsonl}"
 
 PROMPT_MAX_LENGTH="${PROMPT_MAX_LENGTH:-384}"
@@ -55,20 +47,10 @@ HUMANEVAL_SLIME_EVAL_DATA="${HUMANEVAL_SLIME_EVAL_DATA:-${PREPARED_DATA_DIR}/hum
 # ---------------------------------------------------------------------------
 # 2. Parallelism, deploy layout, and resource layout
 # ---------------------------------------------------------------------------
-# DEPLOY_LAYOUT:
-#   single_node     - default; TEACHER_API_BASE may point at localhost or any host
-#   two_node        - set TEACHER_HOST (student node); teacher uses all 8 GPUs elsewhere
-# DEPLOY_ROLE is informational only (teacher|student); student runs this script.
 DEPLOY_LAYOUT="${DEPLOY_LAYOUT:-single_node}"
-DEPLOY_ROLE="${DEPLOY_ROLE:-student}"
-TEACHER_HOST="${TEACHER_HOST:-}"
-TEACHER_PORT="${TEACHER_PORT:-30000}"
+DEPLOY_ROLE="${DEPLOY_ROLE:-trainer}"
 RAY_NODE_IP_ADDRESS="${RAY_NODE_IP_ADDRESS:-127.0.0.1}"
-
-if [[ -n "${TEACHER_HOST}" ]]; then
-  DEPLOY_LAYOUT="two_node"
-  TEACHER_API_BASE="http://${TEACHER_HOST}:${TEACHER_PORT}"
-fi
+USE_EXISTING_RAY="${USE_EXISTING_RAY:-false}"
 
 # Default 8-GPU split in sync non-colocate mode: actor 2, critic 2, rollout 4.
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -96,6 +78,19 @@ ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-4096}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.7}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
+SGLANG_ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-}"
+SGLANG_SAMPLING_BACKEND="${SGLANG_SAMPLING_BACKEND:-}"
+SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER="${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER:-true}"
+SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT="${SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT:-/health_generate}"
+SLIME_SGLANG_HEALTH_TIMEOUT="${SLIME_SGLANG_HEALTH_TIMEOUT:-10}"
+SLIME_SGLANG_HEALTH_MAX_WAIT="${SLIME_SGLANG_HEALTH_MAX_WAIT:-1200}"
+SLIME_ROUTER_WORKER_WAIT_TIMEOUT="${SLIME_ROUTER_WORKER_WAIT_TIMEOUT:-1200}"
+SLIME_ROUTER_WORKER_WAIT_INTERVAL="${SLIME_ROUTER_WORKER_WAIT_INTERVAL:-2}"
+SLIME_ROUTER_WORKER_REQUEST_TIMEOUT="${SLIME_ROUTER_WORKER_REQUEST_TIMEOUT:-10}"
+SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER="${SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER:-true}"
+SLIME_HTTP_REQUEST_TIMEOUT="${SLIME_HTTP_REQUEST_TIMEOUT:-10}"
 
 # ---------------------------------------------------------------------------
 # 5. Optimizer and G2 actor/critic knobs
@@ -112,45 +107,21 @@ CRITIC_LR_HEAD="${CRITIC_LR_HEAD:-0}"
 ZERO_STAGE="${ZERO_STAGE:-3}"
 
 # ---------------------------------------------------------------------------
-# 6. G2 counterfactual teacher and OPD
+# 6. G2 CF-L1OO target: single GT distribution, no distillation
 # ---------------------------------------------------------------------------
-G2_OPD_MODE="${G2_OPD_MODE:-cf_l1oo_opd_sglang}"
-CF_TEACHER_LAMBDA="${CF_TEACHER_LAMBDA:-0.6}"
-CF_TEACHER_N_SAMPLES="${CF_TEACHER_N_SAMPLES:-4}"
-TEACHER_BACKEND="${TEACHER_BACKEND:-remote}"
-if [[ -z "${TEACHER_API_BASE:-}" ]]; then
-  TEACHER_API_BASE="http://127.0.0.1:${TEACHER_PORT}"
-fi
-TEACHER_API_KEY="${TEACHER_API_KEY:-EMPTY}"
-TEACHER_API_STYLE="${TEACHER_API_STYLE:-sglang_generate}"
-TEACHER_MODEL_NAME="${TEACHER_MODEL_NAME:-qwen3.5-27b}"
-if [[ "${DEPLOY_LAYOUT}" == "two_node" ]]; then
-  TEACHER_TIMEOUT="${TEACHER_TIMEOUT:-240}"
-  TEACHER_PREFLIGHT_TIMEOUT="${TEACHER_PREFLIGHT_TIMEOUT:-30}"
-else
-  TEACHER_TIMEOUT="${TEACHER_TIMEOUT:-120}"
-  TEACHER_PREFLIGHT_TIMEOUT="${TEACHER_PREFLIGHT_TIMEOUT:-5}"
-fi
-TEACHER_MAX_RETRIES="${TEACHER_MAX_RETRIES:-3}"
-SKIP_TEACHER_PREFLIGHT="${SKIP_TEACHER_PREFLIGHT:-0}"
-TEACHER_REMOTE_BATCH_SIZE="${TEACHER_REMOTE_BATCH_SIZE:-16}"
-TEACHER_SGLANG_MULTI_SAMPLE="${TEACHER_SGLANG_MULTI_SAMPLE:-true}"
-TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-0.7}"
-TEACHER_TOP_P="${TEACHER_TOP_P:-0.95}"
-TEACHER_MAX_NEW_TOKENS="${TEACHER_MAX_NEW_TOKENS:-1024}"
-TEACHER_SYSTEM_PROMPT_TEXT="${TEACHER_SYSTEM_PROMPT_TEXT:-You are a precise assistant. Produce a correct and well-reasoned answer.}"
-TEACHER_SYSTEM_PROMPT_ID="${TEACHER_SYSTEM_PROMPT_ID:-g2-opd-main-v1}"
-TEACHER_CACHE_ENABLE="${TEACHER_CACHE_ENABLE:-false}"
-TEACHER_CACHE_DIR="${TEACHER_CACHE_DIR:-/mnt/workspace/teacher_cache_shared}"
-
-OPD_KL_COEF="${OPD_KL_COEF:-1.0}"
-OPD_TEACHER_RM_URL="${OPD_TEACHER_RM_URL:-${TEACHER_API_BASE%/}/generate}"
+G2_OPD_MODE="${G2_OPD_MODE:-cf_l1oo_gt_no_distill}"
+CF_TARGET_MODE="${CF_TARGET_MODE:-single}"
+CF_TARGET_NUM_REFS="${CF_TARGET_NUM_REFS:-1}"
+CF_TARGET_STD="${CF_TARGET_STD:-0.0}"
+CF_TARGET_SEED="${CF_TARGET_SEED:-43}"
+CF_TEACHER_LAMBDA="${CF_TEACHER_LAMBDA:-0.0}"
 
 # ---------------------------------------------------------------------------
 # 7. G1 embedding/reward path used by G2
 # ---------------------------------------------------------------------------
 G1_USE_EBFT_LOSS="${G1_USE_EBFT_LOSS:-true}"
 G1_APPLY_DENSE_ATTENTION_MASK="${G1_APPLY_DENSE_ATTENTION_MASK:-false}"
+G1_QA_MASKING="${G1_QA_MASKING:-false}"
 G1_CE_LOSS_COEF="${G1_CE_LOSS_COEF:-0.03}"
 G1_PROMPT_LENGTH="${G1_PROMPT_LENGTH:-}"
 G1_CONTEXT_LENGTH="${G1_CONTEXT_LENGTH:-8}"
@@ -183,7 +154,7 @@ EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-512}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-1024}"
 
 ENABLE_G2_POST_EVAL="${ENABLE_G2_POST_EVAL:-false}"
-CODE_BENCHMARK_SCRIPT="${CODE_BENCHMARK_SCRIPT:-${EBFT_DEPS_ROOT}/scripts/benchmarks/run_code_generation_benchmarks.py}"
+CODE_BENCHMARK_SCRIPT="${CODE_BENCHMARK_SCRIPT:-${SLIME_ROOT}/scripts/benchmarks/run_code_generation_benchmarks.py}"
 CODE_BENCHMARK_PYTHON_BIN="${CODE_BENCHMARK_PYTHON_BIN:-${PYTHON_BIN}}"
 CODE_BENCHMARK_BACKEND="${CODE_BENCHMARK_BACKEND:-hf}"
 CODE_BENCHMARKS="${CODE_BENCHMARKS:-humaneval,mbpp}"
@@ -206,15 +177,15 @@ HUMANEVAL_EVAL_SPLIT="${HUMANEVAL_EVAL_SPLIT:-test}"
 # 10. Checkpoint/artifacts/Ray
 # ---------------------------------------------------------------------------
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/data/slime/outputs}"
-RUN_NAME="${RUN_NAME:-g2_opd_qwen35_2b_main_$(date +%m%d_%H%M%S)}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SLIME_ROOT}/outputs}"
+RUN_NAME="${RUN_NAME:-g2_cf_l1oo_gt_qwen35_2b_1node8_$(date +%m%d_%H%M%S)}"
 LOAD_PATH="${LOAD_PATH:-${OUTPUT_ROOT}/${RUN_NAME}/mcore}"
 SAVE_PATH="${SAVE_PATH:-${LOAD_PATH}}"
 CRITIC_SAVE_PATH="${CRITIC_SAVE_PATH:-${OUTPUT_ROOT}/${RUN_NAME}/critic_mcore}"
 SAVE_HF_PATH_TEMPLATE="${SAVE_HF_PATH_TEMPLATE:-${OUTPUT_ROOT}/${RUN_NAME}/hf/rollout_{rollout_id}}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}/artifacts}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
-RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_g2_opd_main_${USER:-user}}"
+RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_g2_cf_l1oo_gt_${USER:-user}}"
 DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-log_unexpected}"
 RAY_ADDRESS="http://${RAY_NODE_IP_ADDRESS}:${RAY_DASHBOARD_PORT}"
 DRIVER_LOG="${ARTIFACT_DIR}/ray_job_driver.log"
@@ -225,8 +196,12 @@ if [[ -f "${SLIME_ENV_FILE}" ]]; then
   source "${SLIME_ENV_FILE}"
 fi
 
-export PYTHONPATH="${MEGATRON_PATH}:${SLIME_ROOT}:${EBFT_DEPS_ROOT}:${PYTHONPATH:-}"
-export HF_HOME="${HF_HOME:-/mnt/data/ebft-distribution-new/caches/hf}"
+if [[ -n "${EXTRA_PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="${MEGATRON_PATH}:${SLIME_ROOT}:${EXTRA_PYTHONPATH}"
+else
+  export PYTHONPATH="${MEGATRON_PATH}:${SLIME_ROOT}"
+fi
+export HF_HOME="${HF_HOME:-${SLIME_ROOT}/caches/hf}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
@@ -235,6 +210,28 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTHONUNBUFFERED=1
 export RAY_TMPDIR
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
+export SLIME_SGLANG_HEALTH_TIMEOUT
+export SLIME_SGLANG_HEALTH_MAX_WAIT
+export SLIME_ROUTER_WORKER_WAIT_TIMEOUT
+export SLIME_ROUTER_WORKER_WAIT_INTERVAL
+export SLIME_ROUTER_WORKER_REQUEST_TIMEOUT
+export SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER
+export SLIME_HTTP_REQUEST_TIMEOUT
+
+HOST_IP_FOR_NO_PROXY="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+SLIME_NO_PROXY_EXTRA="127.0.0.1,localhost,::1,0.0.0.0,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+if [[ -n "${HOST_IP_FOR_NO_PROXY}" ]]; then
+  SLIME_NO_PROXY_EXTRA="${SLIME_NO_PROXY_EXTRA},${HOST_IP_FOR_NO_PROXY}"
+fi
+if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
+  SLIME_NO_PROXY_EXTRA="${SLIME_NO_PROXY_EXTRA},${RAY_NODE_IP_ADDRESS}"
+fi
+if [[ -n "${NO_PROXY:-}" ]]; then
+  export NO_PROXY="${NO_PROXY},${SLIME_NO_PROXY_EXTRA}"
+else
+  export NO_PROXY="${SLIME_NO_PROXY_EXTRA}"
+fi
+export no_proxy="${NO_PROXY}"
 
 # two_node student follows G1 main: async Megatron + SGLang rollout by default.
 if [[ -z "${ENABLE_ASYNC_TRAIN+x}" ]]; then
@@ -313,12 +310,11 @@ require_positive_int "G1_CONTEXT_LENGTH" "${G1_CONTEXT_LENGTH}"
 require_positive_int "G1_GENERATE_LENGTH" "${G1_GENERATE_LENGTH}"
 require_positive_int "G1_STRIDE" "${G1_STRIDE}"
 require_positive_int "G1_RESPONSE_LENGTH" "${G1_RESPONSE_LENGTH}"
-require_positive_int "CF_TEACHER_N_SAMPLES" "${CF_TEACHER_N_SAMPLES}"
+require_positive_int "CF_TARGET_NUM_REFS" "${CF_TARGET_NUM_REFS}"
 require_bool "G1_FILTER_TRAIN_DATA" "${G1_FILTER_TRAIN_DATA}"
 require_bool "G1_USE_EBFT_LOSS" "${G1_USE_EBFT_LOSS}"
+require_bool "G1_QA_MASKING" "${G1_QA_MASKING}"
 require_bool "USE_WHITENING" "${USE_WHITENING}"
-require_bool "TEACHER_CACHE_ENABLE" "${TEACHER_CACHE_ENABLE}"
-require_bool "TEACHER_SGLANG_MULTI_SAMPLE" "${TEACHER_SGLANG_MULTI_SAMPLE}"
 require_bool "ENABLE_SLIME_EVAL" "${ENABLE_SLIME_EVAL}"
 require_bool "ENABLE_G2_POST_EVAL" "${ENABLE_G2_POST_EVAL}"
 
@@ -326,20 +322,8 @@ case "${DEPLOY_LAYOUT}" in
   single_node|two_node) ;;
   *) echo "[ERROR] DEPLOY_LAYOUT must be single_node or two_node, got: ${DEPLOY_LAYOUT}" >&2; exit 1 ;;
 esac
-if [[ "${DEPLOY_LAYOUT}" == "two_node" && -z "${TEACHER_HOST}" ]]; then
-  echo "[ERROR] two_node layout requires TEACHER_HOST (teacher node IP/hostname reachable from student)." >&2
-  exit 1
-fi
-if [[ "${TEACHER_BACKEND}" != "remote" ]]; then
-  echo "[ERROR] G2+OPD main supports TEACHER_BACKEND=remote only, got: ${TEACHER_BACKEND}" >&2
-  exit 1
-fi
-case "${TEACHER_API_STYLE}" in
-  sglang_generate|completions|chat_completions) ;;
-  *) echo "[ERROR] TEACHER_API_STYLE must be one of sglang_generate, completions, chat_completions; got: ${TEACHER_API_STYLE}" >&2; exit 1 ;;
-esac
-if [[ -z "${TEACHER_API_BASE}" || -z "${TEACHER_MODEL_NAME}" || -z "${OPD_TEACHER_RM_URL}" ]]; then
-  echo "[ERROR] TEACHER_API_BASE, TEACHER_MODEL_NAME, and OPD_TEACHER_RM_URL must be set." >&2
+if [[ "${CF_TARGET_MODE}" != "single" ]]; then
+  echo "[ERROR] G2 no-teacher distribution requires CF_TARGET_MODE=single." >&2
   exit 1
 fi
 if [[ "${G1_EMBEDDING_SOURCE}" != "megatron_ref" || "${G1_REWARD_LOCATION}" != "trainer" ]]; then
@@ -401,19 +385,23 @@ require_file "${RAY_BIN}"
 require_file "${SLIME_TRAIN_DATA}"
 
 if [[ "${G1_FILTER_TRAIN_DATA}" == "true" ]]; then
-  "${PYTHON_BIN}" "${SLIME_ROOT}/exper_scripts/smoketest/filter_g1_prompt_length.py" \
-    --input "${SLIME_TRAIN_DATA}" \
-    --output "${G1_FILTERED_SLIME_TRAIN_DATA}" \
-    --tokenizer "${HF_CHECKPOINT}" \
-    --max-prompt-label-len "${G1_MAX_PROMPT_LABEL_LEN}" \
-    --apply-chat-template
+  if [[ -s "${G1_FILTERED_SLIME_TRAIN_DATA}" ]]; then
+    echo "[data] using existing filtered train data: ${G1_FILTERED_SLIME_TRAIN_DATA}"
+  else
+    "${PYTHON_BIN}" "${SLIME_ROOT}/exper_scripts/smoketest/filter_g1_prompt_length.py" \
+      --input "${SLIME_TRAIN_DATA}" \
+      --output "${G1_FILTERED_SLIME_TRAIN_DATA}" \
+      --tokenizer "${HF_CHECKPOINT}" \
+      --max-prompt-label-len "${G1_MAX_PROMPT_LABEL_LEN}" \
+      --apply-chat-template
+  fi
   SLIME_TRAIN_DATA="${G1_FILTERED_SLIME_TRAIN_DATA}"
 fi
 
 if [[ "${ENABLE_SLIME_EVAL}" == "true" ]]; then
   require_file "${HUMANEVAL_SLIME_EVAL_DATA}"
   if [[ -s "${MBPP_EVAL_DATA}" && ! -s "${MBPP_SLIME_EVAL_DATA}" ]]; then
-    "${PYTHON_BIN}" "${EBFT_DEPS_ROOT}/scripts/diff_dataset/prepare_slime_jsonl.py" \
+    "${PYTHON_BIN}" "${SLIME_ROOT}/scripts/diff_dataset/prepare_slime_jsonl.py" \
       --input "${MBPP_EVAL_DATA}" \
       --output "${MBPP_SLIME_EVAL_DATA}" \
       --input-key question \
@@ -434,6 +422,14 @@ print(len([x for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").
 PY
 )"
 require_positive_int "NUM_GPUS" "${NUM_GPUS}"
+if [[ -z "${RAY_CLUSTER_NUM_GPUS+x}" ]]; then
+  if [[ "${DEPLOY_LAYOUT}" == "two_node" && ("${USE_EXISTING_RAY}" == "true" || "${USE_EXISTING_RAY}" == "1") ]]; then
+    RAY_CLUSTER_NUM_GPUS=$((NUM_GPUS * ${DLC_WORLD_SIZE:-2}))
+  else
+    RAY_CLUSTER_NUM_GPUS="${NUM_GPUS}"
+  fi
+fi
+require_positive_int "RAY_CLUSTER_NUM_GPUS" "${RAY_CLUSTER_NUM_GPUS}"
 require_positive_int "TENSOR_MODEL_PARALLEL_SIZE" "${TENSOR_MODEL_PARALLEL_SIZE}"
 require_positive_int "PIPELINE_MODEL_PARALLEL_SIZE" "${PIPELINE_MODEL_PARALLEL_SIZE}"
 require_positive_int "CONTEXT_PARALLEL_SIZE" "${CONTEXT_PARALLEL_SIZE}"
@@ -481,15 +477,15 @@ require_positive_int "ACTOR_NUM_GPUS_PER_NODE" "${ACTOR_NUM_GPUS_PER_NODE}"
 
 if [[ "${COLOCATE}" == "false" ]]; then
   if [[ -z "${ROLLOUT_NUM_GPUS+x}" ]]; then
-    ROLLOUT_NUM_GPUS=$((NUM_GPUS - ACTOR_NUM_GPUS_PER_NODE - CRITIC_TOTAL_GPUS))
+    ROLLOUT_NUM_GPUS=$((RAY_CLUSTER_NUM_GPUS - ACTOR_NUM_GPUS_PER_NODE - CRITIC_TOTAL_GPUS))
     if (( ROLLOUT_NUM_GPUS <= 0 )); then
-      echo "[ERROR] Default G2 GPU split leaves no rollout GPUs: NUM_GPUS=${NUM_GPUS}, ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE}, CRITIC_TOTAL_GPUS=${CRITIC_TOTAL_GPUS}" >&2
+      echo "[ERROR] Default G2 GPU split leaves no rollout GPUs: RAY_CLUSTER_NUM_GPUS=${RAY_CLUSTER_NUM_GPUS}, NUM_GPUS=${NUM_GPUS}, ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE}, CRITIC_TOTAL_GPUS=${CRITIC_TOTAL_GPUS}" >&2
       exit 1
     fi
   fi
   require_positive_int "ROLLOUT_NUM_GPUS" "${ROLLOUT_NUM_GPUS}"
-  if (( ACTOR_NUM_GPUS_PER_NODE + CRITIC_TOTAL_GPUS + ROLLOUT_NUM_GPUS > NUM_GPUS )); then
-    echo "[ERROR] ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} + CRITIC_TOTAL_GPUS=${CRITIC_TOTAL_GPUS} + ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} must be <= NUM_GPUS=${NUM_GPUS}" >&2
+  if (( ACTOR_NUM_GPUS_PER_NODE + CRITIC_TOTAL_GPUS + ROLLOUT_NUM_GPUS > RAY_CLUSTER_NUM_GPUS )); then
+    echo "[ERROR] ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} + CRITIC_TOTAL_GPUS=${CRITIC_TOTAL_GPUS} + ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} must be <= RAY_CLUSTER_NUM_GPUS=${RAY_CLUSTER_NUM_GPUS} (local NUM_GPUS=${NUM_GPUS})" >&2
     exit 1
   fi
 else
@@ -516,9 +512,6 @@ if (( ROLLOUT_BATCH_SIZE % DP_SIZE != 0 )); then
 fi
 
 mkdir -p "${ARTIFACT_DIR}" "${LOAD_PATH}" "${SAVE_PATH}" "${CRITIC_SAVE_PATH}" "${RAY_TMPDIR}"
-if [[ "${TEACHER_CACHE_ENABLE}" == "true" ]]; then
-  mkdir -p "${TEACHER_CACHE_DIR}"
-fi
 
 MODEL_ARGS=(
   --spec slime_plugins.models.qwen3_5 get_qwen3_5_spec
@@ -580,28 +573,11 @@ CMD=(
   --adam-beta2 "${ADAM_BETA2}"
   --advantage-estimator g1
   --distribution-reward-type cf_l1oo
-  --cf-target-mode teacher
+  --cf-target-mode "${CF_TARGET_MODE}"
+  --cf-target-num-refs "${CF_TARGET_NUM_REFS}"
+  --cf-target-std "${CF_TARGET_STD}"
+  --cf-target-seed "${CF_TARGET_SEED}"
   --cf-teacher-lambda "${CF_TEACHER_LAMBDA}"
-  --cf-teacher-n-samples "${CF_TEACHER_N_SAMPLES}"
-  --teacher-backend "${TEACHER_BACKEND}"
-  --teacher-api-base "${TEACHER_API_BASE}"
-  --teacher-api-key "${TEACHER_API_KEY}"
-  --teacher-api-style "${TEACHER_API_STYLE}"
-  --teacher-model-name "${TEACHER_MODEL_NAME}"
-  --teacher-timeout "${TEACHER_TIMEOUT}"
-  --teacher-max-retries "${TEACHER_MAX_RETRIES}"
-  --teacher-remote-batch-size "${TEACHER_REMOTE_BATCH_SIZE}"
-  --teacher-temperature "${TEACHER_TEMPERATURE}"
-  --teacher-top-p "${TEACHER_TOP_P}"
-  --teacher-max-new-tokens "${TEACHER_MAX_NEW_TOKENS}"
-  --teacher-system-prompt-text "${TEACHER_SYSTEM_PROMPT_TEXT}"
-  --teacher-system-prompt-id "${TEACHER_SYSTEM_PROMPT_ID}"
-  --use-opd
-  --opd-type sglang
-  --opd-kl-coef "${OPD_KL_COEF}"
-  --custom-rm-path slime.rollout.on_policy_distillation.reward_func
-  --custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
-  --rm-url "${OPD_TEACHER_RM_URL}"
   --entropy-coef "${ENTROPY_COEF}"
   --eps-clip "${EPS_CLIP}"
   --eps-clip-high "${EPS_CLIP_HIGH}"
@@ -653,13 +629,26 @@ fi
 if [[ "${G1_USE_EBFT_LOSS}" == "true" ]]; then
   CMD+=(--g1-use-ebft-loss)
 fi
-if [[ "${TEACHER_CACHE_ENABLE}" == "true" ]]; then
-  CMD+=(--teacher-cache-enable --teacher-cache-dir "${TEACHER_CACHE_DIR}")
+if [[ "${G1_QA_MASKING}" == "true" ]]; then
+  CMD+=(--g1-qa-masking)
 fi
-if [[ "${TEACHER_SGLANG_MULTI_SAMPLE}" == "true" ]]; then
-  CMD+=(--teacher-sglang-multi-sample)
-else
-  CMD+=(--no-teacher-sglang-multi-sample)
+if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" == "true" ]]; then
+  CMD+=(--sglang-disable-cuda-graph)
+fi
+if [[ -n "${SGLANG_MAX_RUNNING_REQUESTS}" ]]; then
+  CMD+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
+fi
+if [[ -n "${SGLANG_ATTENTION_BACKEND}" ]]; then
+  CMD+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
+fi
+if [[ -n "${SGLANG_SAMPLING_BACKEND}" ]]; then
+  CMD+=(--sglang-sampling-backend "${SGLANG_SAMPLING_BACKEND}")
+fi
+if [[ "${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER}" == "true" ]]; then
+  CMD+=(--router-disable-circuit-breaker)
+fi
+if [[ -n "${SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT}" ]]; then
+  CMD+=(--router-health-check-endpoint "${SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT}")
 fi
 if [[ "${COLOCATE}" == "true" ]]; then
   CMD+=(--colocate)
@@ -692,8 +681,6 @@ write_run_context_artifact() {
 RUN_NAME=${RUN_NAME}
 DEPLOY_LAYOUT=${DEPLOY_LAYOUT}
 DEPLOY_ROLE=${DEPLOY_ROLE}
-TEACHER_HOST=${TEACHER_HOST}
-TEACHER_PORT=${TEACHER_PORT}
 RAY_NODE_IP_ADDRESS=${RAY_NODE_IP_ADDRESS}
 RAY_ADDRESS=${RAY_ADDRESS}
 G2_OPD_MODE=${G2_OPD_MODE}
@@ -704,7 +691,9 @@ SAVE_HF_PATH_TEMPLATE=${SAVE_HF_PATH_TEMPLATE}
 ARTIFACT_DIR=${ARTIFACT_DIR}
 DIST_CKPT_STRICTNESS=${DIST_CKPT_STRICTNESS}
 SLIME_ROOT=${SLIME_ROOT}
-EBFT_DEPS_ROOT=${EBFT_DEPS_ROOT}
+PROJECT_ROOT=${PROJECT_ROOT}
+SLIME_DATA_ROOT=${SLIME_DATA_ROOT}
+PREPARED_DATA_DIR=${PREPARED_DATA_DIR}
 MEGATRON_PATH=${MEGATRON_PATH}
 PYTHON_BIN=${PYTHON_BIN}
 RAY_BIN=${RAY_BIN}
@@ -714,6 +703,7 @@ COMPLETION_MAX_LENGTH=${COMPLETION_MAX_LENGTH}
 G1_FILTER_TRAIN_DATA=${G1_FILTER_TRAIN_DATA}
 G1_MAX_PROMPT_LABEL_LEN=${G1_MAX_PROMPT_LABEL_LEN}
 NUM_GPUS=${NUM_GPUS}
+RAY_CLUSTER_NUM_GPUS=${RAY_CLUSTER_NUM_GPUS}
 DP_SIZE=${DP_SIZE}
 PARALLEL_GROUP_SIZE=${PARALLEL_GROUP_SIZE}
 ENABLE_ASYNC_TRAIN=${ENABLE_ASYNC_TRAIN}
@@ -740,6 +730,21 @@ ROLLOUT_TOP_P=${ROLLOUT_TOP_P}
 SGLANG_CONTEXT_LENGTH=${SGLANG_CONTEXT_LENGTH}
 SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY}
 SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC}
+SGLANG_DISABLE_CUDA_GRAPH=${SGLANG_DISABLE_CUDA_GRAPH}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS}
+SGLANG_ATTENTION_BACKEND=${SGLANG_ATTENTION_BACKEND}
+SGLANG_SAMPLING_BACKEND=${SGLANG_SAMPLING_BACKEND}
+SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER=${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER}
+SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT=${SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT}
+SLIME_SGLANG_HEALTH_TIMEOUT=${SLIME_SGLANG_HEALTH_TIMEOUT}
+SLIME_SGLANG_HEALTH_MAX_WAIT=${SLIME_SGLANG_HEALTH_MAX_WAIT}
+SLIME_ROUTER_WORKER_WAIT_TIMEOUT=${SLIME_ROUTER_WORKER_WAIT_TIMEOUT}
+SLIME_ROUTER_WORKER_WAIT_INTERVAL=${SLIME_ROUTER_WORKER_WAIT_INTERVAL}
+SLIME_ROUTER_WORKER_REQUEST_TIMEOUT=${SLIME_ROUTER_WORKER_REQUEST_TIMEOUT}
+SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER=${SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER}
+SLIME_HTTP_REQUEST_TIMEOUT=${SLIME_HTTP_REQUEST_TIMEOUT}
+NO_PROXY=${NO_PROXY}
+no_proxy=${no_proxy}
 LR=${LR}
 WEIGHT_DECAY=${WEIGHT_DECAY}
 ADAM_BETA1=${ADAM_BETA1}
@@ -750,28 +755,14 @@ ENTROPY_COEF=${ENTROPY_COEF}
 CRITIC_LR=${CRITIC_LR}
 CRITIC_LR_HEAD=${CRITIC_LR_HEAD}
 ZERO_STAGE=${ZERO_STAGE}
+CF_TARGET_MODE=${CF_TARGET_MODE}
+CF_TARGET_NUM_REFS=${CF_TARGET_NUM_REFS}
+CF_TARGET_STD=${CF_TARGET_STD}
+CF_TARGET_SEED=${CF_TARGET_SEED}
 CF_TEACHER_LAMBDA=${CF_TEACHER_LAMBDA}
-CF_TEACHER_N_SAMPLES=${CF_TEACHER_N_SAMPLES}
-TEACHER_BACKEND=${TEACHER_BACKEND}
-TEACHER_API_BASE=${TEACHER_API_BASE}
-TEACHER_MODEL_NAME=${TEACHER_MODEL_NAME}
-TEACHER_API_STYLE=${TEACHER_API_STYLE}
-TEACHER_TIMEOUT=${TEACHER_TIMEOUT}
-TEACHER_MAX_RETRIES=${TEACHER_MAX_RETRIES}
-TEACHER_REMOTE_BATCH_SIZE=${TEACHER_REMOTE_BATCH_SIZE}
-TEACHER_SGLANG_MULTI_SAMPLE=${TEACHER_SGLANG_MULTI_SAMPLE}
-TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE}
-TEACHER_TOP_P=${TEACHER_TOP_P}
-TEACHER_MAX_NEW_TOKENS=${TEACHER_MAX_NEW_TOKENS}
-TEACHER_SYSTEM_PROMPT_ID=${TEACHER_SYSTEM_PROMPT_ID}
-TEACHER_PREFLIGHT_TIMEOUT=${TEACHER_PREFLIGHT_TIMEOUT}
-SKIP_TEACHER_PREFLIGHT=${SKIP_TEACHER_PREFLIGHT}
-TEACHER_CACHE_ENABLE=${TEACHER_CACHE_ENABLE}
-TEACHER_CACHE_DIR=${TEACHER_CACHE_DIR}
-OPD_KL_COEF=${OPD_KL_COEF}
-OPD_TEACHER_RM_URL=${OPD_TEACHER_RM_URL}
 G1_USE_EBFT_LOSS=${G1_USE_EBFT_LOSS}
 G1_APPLY_DENSE_ATTENTION_MASK=${G1_APPLY_DENSE_ATTENTION_MASK}
+G1_QA_MASKING=${G1_QA_MASKING}
 G1_CE_LOSS_COEF=${G1_CE_LOSS_COEF}
 G1_PROMPT_LENGTH=${G1_PROMPT_LENGTH}
 G1_NUM_BLOCKS=${G1_NUM_BLOCKS}
@@ -825,14 +816,13 @@ else
   echo "[WARN] failed to write ${ARTIFACT_DIR}/run_context.env; continuing without run context artifact" >&2
 fi
 
-echo "[main-test] G2 + OPD Slime/Megatron run"
+echo "[main-test] G2 CF-L1OO-GT no-distill Slime/Megatron run"
 echo "[main-test] DEPLOY_LAYOUT=${DEPLOY_LAYOUT} DEPLOY_ROLE=${DEPLOY_ROLE} RAY_ADDRESS=${RAY_ADDRESS}"
 echo "[main-test] RUN_NAME=${RUN_NAME}"
 echo "[main-test] mode=${G2_OPD_MODE} NUM_EPOCH=${NUM_EPOCH} NUM_ROLLOUT=${NUM_ROLLOUT:-auto} ENABLE_SLIME_EVAL=${ENABLE_SLIME_EVAL} ENABLE_G2_POST_EVAL=${ENABLE_G2_POST_EVAL}"
-echo "[main-test] teacher=${TEACHER_API_BASE} style=${TEACHER_API_STYLE} model=${TEACHER_MODEL_NAME} opd_rm=${OPD_TEACHER_RM_URL}"
-echo "[main-test] cf_l1oo lambda=${CF_TEACHER_LAMBDA} teacher_samples=${CF_TEACHER_N_SAMPLES} opd_kl=${OPD_KL_COEF} teacher_cache=${TEACHER_CACHE_ENABLE}"
+echo "[main-test] cf_l1oo target=${CF_TARGET_MODE} lambda=${CF_TEACHER_LAMBDA} target_refs=${CF_TARGET_NUM_REFS}"
 echo "[main-test] ebft_loss=${G1_USE_EBFT_LOSS} ce_loss_coef=${G1_CE_LOSS_COEF}"
-echo "[preflight] NUM_GPUS=${NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} CRITIC_NUM_NODES=${CRITIC_NUM_NODES} CRITIC_NUM_GPUS_PER_NODE=${CRITIC_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
+echo "[preflight] NUM_GPUS=${NUM_GPUS} RAY_CLUSTER_NUM_GPUS=${RAY_CLUSTER_NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} CRITIC_NUM_NODES=${CRITIC_NUM_NODES} CRITIC_NUM_GPUS_PER_NODE=${CRITIC_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
 echo "[preflight] TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} ACTOR_DP=${DP_SIZE}"
 echo "[submit] command:"
 printf "%q " "${CMD[@]}"
@@ -843,121 +833,21 @@ if [[ "${PRINT_ONLY:-0}" == "1" || "${DRY_RUN_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-if [[ "${SKIP_TEACHER_PREFLIGHT}" == "1" ]]; then
-  echo "[preflight] skipping teacher API reachability checks because SKIP_TEACHER_PREFLIGHT=1"
+if [[ "${USE_EXISTING_RAY}" == "true" || "${USE_EXISTING_RAY}" == "1" ]]; then
+  echo "[ray] using existing Ray cluster at ${RAY_ADDRESS}"
 else
-  if [[ "${TEACHER_API_STYLE}" == "sglang_generate" ]]; then
-    if [[ "${TEACHER_API_BASE%/}" == */generate ]]; then
-      TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}"
-    else
-      TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}/generate"
-    fi
-    TEACHER_PREFLIGHT_METHOD="POST_GENERATE"
-  else
-    TEACHER_PREFLIGHT_URL="${TEACHER_API_BASE%/}/models"
-    TEACHER_PREFLIGHT_METHOD="GET_MODELS"
-  fi
-  echo "[preflight] checking G2 teacher API reachability: ${TEACHER_PREFLIGHT_URL}"
-  if ! TEACHER_PREFLIGHT_URL="${TEACHER_PREFLIGHT_URL}" \
-       TEACHER_PREFLIGHT_METHOD="${TEACHER_PREFLIGHT_METHOD}" \
-       TEACHER_API_KEY="${TEACHER_API_KEY}" \
-       TEACHER_PREFLIGHT_TIMEOUT="${TEACHER_PREFLIGHT_TIMEOUT}" \
-       "${PYTHON_BIN}" - <<'PY'
-import json
-import os
-import sys
-import urllib.request
+  "${RAY_BIN}" stop --force 2>/dev/null || true
+  sleep 3
 
-url = os.environ["TEACHER_PREFLIGHT_URL"]
-method = os.environ["TEACHER_PREFLIGHT_METHOD"]
-timeout = float(os.environ.get("TEACHER_PREFLIGHT_TIMEOUT", "5"))
-api_key = os.environ.get("TEACHER_API_KEY", "EMPTY")
-if method == "POST_GENERATE":
-    payload = {
-        "text": "ping",
-        "sampling_params": {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_new_tokens": 1,
-            "skip_special_tokens": True,
-        },
-        "return_logprob": False,
-    }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="POST",
-    )
-else:
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"}, method="GET")
-try:
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        response.read(1)
-except Exception as exc:
-    print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-  then
-    echo "[ERROR] G2 teacher API preflight failed for ${TEACHER_PREFLIGHT_URL}" >&2
-    echo "[ERROR] Start the teacher service first, or set SKIP_TEACHER_PREFLIGHT=1 for special network environments." >&2
-    exit 1
-  fi
-
-  echo "[preflight] checking OPD reward/logprob API reachability: ${OPD_TEACHER_RM_URL}"
-  if ! OPD_TEACHER_RM_URL="${OPD_TEACHER_RM_URL}" \
-       TEACHER_API_KEY="${TEACHER_API_KEY}" \
-       TEACHER_PREFLIGHT_TIMEOUT="${TEACHER_PREFLIGHT_TIMEOUT}" \
-       "${PYTHON_BIN}" - <<'PY'
-import json
-import os
-import sys
-import urllib.request
-
-url = os.environ["OPD_TEACHER_RM_URL"]
-timeout = float(os.environ.get("TEACHER_PREFLIGHT_TIMEOUT", "5"))
-api_key = os.environ.get("TEACHER_API_KEY", "EMPTY")
-payload = {
-    "text": "ping",
-    "sampling_params": {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_new_tokens": 1,
-        "skip_special_tokens": True,
-    },
-    "return_logprob": True,
-}
-request = urllib.request.Request(
-    url,
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        response.read(1)
-except Exception as exc:
-    print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-  then
-    echo "[ERROR] OPD teacher RM preflight failed for ${OPD_TEACHER_RM_URL}" >&2
-    echo "[ERROR] Set OPD_TEACHER_RM_URL to the SGLang /generate endpoint that can return logprobs." >&2
-    exit 1
-  fi
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+  "${RAY_BIN}" start --head \
+    --node-ip-address "${RAY_NODE_IP_ADDRESS}" \
+    --num-gpus "${NUM_GPUS}" \
+    --disable-usage-stats \
+    --dashboard-host=0.0.0.0 \
+    --dashboard-port="${RAY_DASHBOARD_PORT}" \
+    --temp-dir "${RAY_TMPDIR}"
 fi
-
-"${RAY_BIN}" stop --force 2>/dev/null || true
-sleep 3
-
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
-"${RAY_BIN}" start --head \
-  --node-ip-address "${RAY_NODE_IP_ADDRESS}" \
-  --num-gpus "${NUM_GPUS}" \
-  --disable-usage-stats \
-  --dashboard-host=0.0.0.0 \
-  --dashboard-port="${RAY_DASHBOARD_PORT}" \
-  --temp-dir "${RAY_TMPDIR}"
 
 RUNTIME_ENV_JSON="$("${PYTHON_BIN}" - <<'PY'
 import json, os
@@ -966,6 +856,10 @@ keys = [
     "CUDA_DEVICE_MAX_CONNECTIONS", "HF_HOME", "HF_HUB_OFFLINE",
     "HF_DATASETS_OFFLINE", "HF_HUB_DISABLE_XET", "TOKENIZERS_PARALLELISM",
     "RAY_TMPDIR", "PYTHONUNBUFFERED", "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK",
+    "SLIME_SGLANG_HEALTH_TIMEOUT", "SLIME_SGLANG_HEALTH_MAX_WAIT",
+    "SLIME_ROUTER_WORKER_WAIT_TIMEOUT", "SLIME_ROUTER_WORKER_WAIT_INTERVAL",
+    "SLIME_ROUTER_WORKER_REQUEST_TIMEOUT", "SLIME_ROUTER_DISABLE_CIRCUIT_BREAKER",
+    "SLIME_HTTP_REQUEST_TIMEOUT", "NO_PROXY", "no_proxy",
 ]
 print(json.dumps({"env_vars": {k: os.environ[k] for k in keys if os.environ.get(k)}}))
 PY

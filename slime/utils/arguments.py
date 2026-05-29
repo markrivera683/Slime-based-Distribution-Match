@@ -435,6 +435,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval for updating the weights",
             )
             parser.add_argument(
+                "--skip-initial-update-weights",
+                action="store_true",
+                default=False,
+                help="Skip the initial actor-to-rollout weight sync. Intended for debugging matching initial checkpoints.",
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",
@@ -1008,6 +1014,52 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--use-effopd",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable EffOPD mechanism validation for the current G2 cf_l1oo + SGLang OPD workflow. "
+                    "Here G2 means cf_l1oo reward; OPD means SGLang teacher-logprob distillation."
+                ),
+            )
+            parser.add_argument("--effopd-dv-size", type=int, default=50, help="EffOPD lightweight D_v size.")
+            parser.add_argument("--effopd-dv-seed", type=int, default=42, help="EffOPD D_v sampling seed.")
+            parser.add_argument("--effopd-max-k", type=int, default=5, help="Maximum EffOPD candidate k.")
+            parser.add_argument(
+                "--effopd-max-triggers",
+                type=int,
+                default=-1,
+                help="Maximum number of EffOPD power-of-two trigger events; -1 means unlimited.",
+            )
+            parser.add_argument(
+                "--effopd-lr-decay",
+                type=float,
+                default=0.5,
+                help="Learning-rate multiplier applied after an accepted EffOPD extrapolation.",
+            )
+            parser.add_argument(
+                "--effopd-validation-mode",
+                type=str,
+                choices=["opd_kl_shadow_cf", "combined_shadow", "combined_gate"],
+                default="opd_kl_shadow_cf",
+                help=(
+                    "EffOPD validation mode. Shadow modes log G2 cf_l1oo reward and OPD KL separately; "
+                    "combined_gate applies D_v candidate scoring as the accept gate."
+                ),
+            )
+            parser.add_argument(
+                "--effopd-force-weight-sync",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Force SGLang weight sync after an EffOPD trigger so the next rollout uses the accepted actor.",
+            )
+            parser.add_argument(
+                "--effopd-state-dir",
+                type=str,
+                default="auto",
+                help="EffOPD sidecar state directory. 'auto' stores sidecars under {save}/effopd.",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1244,9 +1296,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--cf-target-mode",
                 type=str,
-                choices=["single", "teacher"],
+                choices=["single", "teacher", "opd_onpolicy"],
                 default=None,
-                help="G2 target mode. Use 'single' for no-teacher distribution matching or 'teacher' for teacher target mode.",
+                help=(
+                    "G2 target mode. Use 'single' for no-teacher distribution matching, 'teacher' for "
+                    "teacher completion target mode, or 'opd_onpolicy' for OPD-CF-L1OO over student rollouts."
+                ),
             )
             parser.add_argument(
                 "--cf-target-num-refs",
@@ -1272,6 +1327,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--cf-alpha", type=float, default=0.5, help="CF amplitude discrepancy weight for G2.")
             parser.add_argument("--cf-beta", type=float, default=0.5, help="CF phase discrepancy weight for G2.")
             parser.add_argument("--cf-reward-scale", type=float, default=1.0, help="Reward scale for G2 cf_l1oo.")
+            parser.add_argument(
+                "--opd-cf-score-temperature",
+                type=float,
+                default=1.0,
+                help="Softmax temperature for OPD-CF-L1OO teacher rollout scores.",
+            )
+            parser.add_argument(
+                "--opd-cf-score-normalization",
+                type=str,
+                choices=["mean", "sum"],
+                default="mean",
+                help="How OPD-CF-L1OO aggregates teacher token logprobs into rollout scores.",
+            )
+            parser.add_argument(
+                "--opd-credit-assignment",
+                type=str,
+                choices=["cf_l1oo", "ebft"],
+                default="cf_l1oo",
+                help=(
+                    "Credit assignment for cf-target-mode=opd_onpolicy. cf_l1oo uses CF distribution LOO; "
+                    "ebft is a pointwise EBFT-style baseline against the teacher-weighted on-policy centroid."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-application",
+                type=str,
+                choices=["auto", "token_penalty", "cf_l1oo", "both"],
+                default="auto",
+                help=(
+                    "How OPD reverse-KL is applied. auto keeps the current token penalty except "
+                    "cf-target-mode=opd_onpolicy, where reverse-KL is logged but not double-applied."
+                ),
+            )
             parser.add_argument(
                 "--cf-teacher-lambda",
                 type=float,
@@ -1405,6 +1493,42 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Use OpenRLHF-style EBFT actor loss (self-ratio, no PPO clipping, prompt CE via masked_mean) "
                     "instead of the default PPO policy loss path. Gated: requires full-sequence ``ebft_*`` tensors "
                     "on the Megatron batch (see ``slime/utils/g1_ebft_data_contract.py``) and ``advantage_estimator=g1``."
+                ),
+            )
+            parser.add_argument(
+                "--g1-ebft-logprob-indexing",
+                type=str,
+                choices=["standard_next_token", "strict_block_source"],
+                default="standard_next_token",
+                help=(
+                    "Logit-row indexing for --g1-use-ebft-loss. 'standard_next_token' keeps the existing "
+                    "row i -> token i+1 gather. 'strict_block_source' gathers generated/action log-probs from "
+                    "OpenRLHF EBFT block-prediction source rows while keeping the EBFT RL/CE masks target-aligned."
+                ),
+            )
+            parser.add_argument(
+                "--g1-ebft-rollout-sampling-mode",
+                type=str,
+                choices=["standard", "block_source"],
+                default="standard",
+                help=(
+                    "Rollout sampling semantics for G1 EBFT. 'standard' uses ordinary SGLang generation. "
+                    "'block_source' experimentally supports strict dense4d+torch_native or "
+                    "sparse_ir+triton rollout with any valid --g1-generate-length > 0 and "
+                    "overlap schedule disabled."
+                ),
+            )
+            parser.add_argument(
+                "--g1-ebft-rollout-mask-mode",
+                type=str,
+                choices=["none", "dense4d", "sparse_ir"],
+                default="none",
+                help=(
+                    "Attach G1 EBFT rollout mask transport data to each SGLang /generate payload. "
+                    "'dense4d' sends ebft_dense_attention_mask + ebft_position_ids; "
+                    "'sparse_ir' sends ebft_sparse_ir + ebft_position_ids. Both send ebft_mask_spec. "
+                    "block_source sampling accepts dense4d only with torch_native attention and sparse_ir "
+                    "only with Triton attention."
                 ),
             )
             parser.add_argument(
@@ -1786,8 +1910,10 @@ def assert_g2_standard_args(args) -> None:
         return
 
     cf_target_mode = getattr(args, "cf_target_mode", None)
-    if cf_target_mode not in {"single", "teacher"}:
-        raise ValueError("G2 requires --distribution-reward-type cf_l1oo with --cf-target-mode single or teacher.")
+    if cf_target_mode not in {"single", "teacher", "opd_onpolicy"}:
+        raise ValueError(
+            "G2 requires --distribution-reward-type cf_l1oo with --cf-target-mode single, teacher, or opd_onpolicy."
+        )
     if getattr(args, "advantage_estimator", None) != "g1":
         raise ValueError("Standard G2 currently reuses Slime's token-advantage path; set --advantage-estimator g1.")
     if getattr(args, "g1_embedding_source", "rollout") != "megatron_ref" or getattr(args, "g1_reward_location", "rollout") != "trainer":
@@ -1795,7 +1921,16 @@ def assert_g2_standard_args(args) -> None:
             "Standard G2 cf_l1oo requires trainer-side frozen critic embeddings: "
             "set --g1-embedding-source megatron_ref --g1-reward-location trainer."
         )
-    if cf_target_mode == "single":
+    if cf_target_mode == "opd_onpolicy":
+        if not getattr(args, "use_opd", False):
+            raise ValueError("OPD-CF-L1OO requires --use-opd.")
+        if int(getattr(args, "n_samples_per_prompt", 1)) <= 1:
+            raise ValueError("OPD-CF-L1OO requires --n-samples-per-prompt > 1.")
+        if float(getattr(args, "opd_cf_score_temperature", 1.0)) <= 0.0:
+            raise ValueError("--opd-cf-score-temperature must be positive.")
+        if getattr(args, "opd_credit_assignment", "cf_l1oo") not in {"cf_l1oo", "ebft"}:
+            raise ValueError("--opd-credit-assignment must be 'cf_l1oo' or 'ebft'.")
+    elif cf_target_mode == "single":
         if getattr(args, "teacher_backend", None) is not None:
             raise ValueError("G2 no-teacher distribution mode should not set --teacher-backend.")
         if getattr(args, "teacher_api_base", None) or getattr(args, "teacher_model_name", None):
@@ -1818,7 +1953,11 @@ def assert_g2_standard_args(args) -> None:
             raise ValueError("--cf-teacher-lambda must be in (0, 1] for standard G2.")
     if not bool(getattr(args, "use_whitening", False)):
         raise ValueError("Standard G2 requires --use-whitening to match OpenRLHF reward construction.")
-    if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) != "sglang":
+    if (
+        getattr(args, "use_opd", False)
+        and cf_target_mode != "opd_onpolicy"
+        and getattr(args, "opd_type", None) != "sglang"
+    ):
         raise ValueError(
             "Standard G2 cf_l1oo can only be combined with SGLang OPD teacher_log_probs; "
             "set --opd-type sglang or remove --use-opd."
@@ -1884,6 +2023,28 @@ def slime_validate_args(args):
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+
+    if getattr(args, "use_effopd", False):
+        if not getattr(args, "use_opd", False) or getattr(args, "opd_type", None) != "sglang":
+            raise ValueError("EffOPD currently targets SGLang OPD; set --use-opd --opd-type sglang.")
+        if getattr(args, "distribution_reward_type", "pointwise") != "cf_l1oo":
+            raise ValueError("EffOPD currently targets G2 cf_l1oo reward; set --distribution-reward-type cf_l1oo.")
+        if getattr(args, "cf_target_mode", None) != "teacher":
+            raise ValueError("EffOPD currently targets G2 teacher mode; set --cf-target-mode teacher.")
+        if getattr(args, "colocate", False):
+            raise ValueError("EffOPD mechanism validation currently supports non-colocate G2+OPD runs only.")
+        if not getattr(args, "enable_weights_backuper", True):
+            raise ValueError("EffOPD requires weights backuper; remove --disable-weights-backuper.")
+        if int(getattr(args, "effopd_dv_size", 50)) <= 0:
+            raise ValueError("--effopd-dv-size must be positive.")
+        if float(getattr(args, "effopd_lr_decay", 0.5)) <= 0.0:
+            raise ValueError("--effopd-lr-decay must be positive.")
+        if int(getattr(args, "effopd_max_k", 5)) < 1:
+            raise ValueError("--effopd-max-k must be >= 1.")
+        logger.info(
+            "EffOPD enabled for G2 cf_l1oo + SGLang OPD. Terminology: G2=cf_l1oo reward, "
+            "OPD=teacher-logprob distillation, G2+OPD=current combined workflow."
+        )
 
     if args.megatron_to_hf_mode == "bridge":
         if (
@@ -1969,6 +2130,69 @@ def slime_validate_args(args):
             raise ValueError("--g1-use-ebft-loss is incompatible with --use-opsm")
         if getattr(args, "use_tis", False) or getattr(args, "get_mismatch_metrics", False):
             raise ValueError("--g1-use-ebft-loss is incompatible with --use-tis / --get-mismatch-metrics")
+        if getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") == "strict_block_source":
+            remainder = int(args.g1_prompt_length) - int(args.g1_generate_length) - int(args.g1_context_length)
+            if remainder < 0 or remainder % int(args.g1_stride) != 0:
+                raise ValueError(
+                    "--g1-ebft-logprob-indexing strict_block_source requires valid G1 strided-block geometry"
+                )
+            num_blocks = remainder // int(args.g1_stride) + 1
+            expected_response_length = int(args.g1_generate_length) * num_blocks
+            if int(args.g1_response_length) != expected_response_length:
+                raise ValueError(
+                    "--g1-ebft-logprob-indexing strict_block_source requires "
+                    "g1_response_length == g1_generate_length * num_blocks "
+                    f"({args.g1_response_length} != {args.g1_generate_length} * {num_blocks})"
+                )
+    elif getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "standard_next_token":
+        raise ValueError("--g1-ebft-logprob-indexing strict_block_source requires --g1-use-ebft-loss")
+
+    rollout_sampling_mode = getattr(args, "g1_ebft_rollout_sampling_mode", "standard")
+    rollout_mask_mode = getattr(args, "g1_ebft_rollout_mask_mode", "none")
+    if rollout_sampling_mode not in {"standard", "block_source"}:
+        raise ValueError(
+            "--g1-ebft-rollout-sampling-mode must be standard or block_source, "
+            f"got {rollout_sampling_mode!r}"
+        )
+    if rollout_mask_mode not in {"none", "dense4d", "sparse_ir"}:
+        raise ValueError(f"--g1-ebft-rollout-mask-mode must be none, dense4d, or sparse_ir, got {rollout_mask_mode!r}")
+    if rollout_mask_mode != "none" and rollout_sampling_mode == "standard":
+        raise ValueError(
+            "--g1-ebft-rollout-mask-mode is transport only and requires "
+            "--g1-ebft-rollout-sampling-mode block_source; standard sampling cannot consume EBFT rollout masks"
+        )
+    if rollout_sampling_mode == "block_source":
+        if rollout_mask_mode not in {"dense4d", "sparse_ir"}:
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--g1-ebft-rollout-mask-mode dense4d or sparse_ir"
+            )
+        if not bool(getattr(args, "g1_use_ebft_loss", False)):
+            raise ValueError("--g1-ebft-rollout-sampling-mode block_source requires --g1-use-ebft-loss")
+        if getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "strict_block_source":
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--g1-ebft-logprob-indexing strict_block_source"
+            )
+        if hasattr(args, "sglang_attention_backend"):
+            sglang_attention_backend = getattr(args, "sglang_attention_backend")
+            if rollout_mask_mode == "dense4d" and sglang_attention_backend != "torch_native":
+                raise ValueError(
+                    "--g1-ebft-rollout-sampling-mode block_source with dense4d requires "
+                    "--sglang-attention-backend torch_native"
+                )
+            if rollout_mask_mode == "sparse_ir" and sglang_attention_backend != "triton":
+                raise ValueError(
+                    "--g1-ebft-rollout-sampling-mode block_source with sparse_ir requires "
+                    "--sglang-attention-backend triton"
+                )
+        if hasattr(args, "sglang_disable_overlap_schedule") and not bool(
+            getattr(args, "sglang_disable_overlap_schedule")
+        ):
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--sglang-disable-overlap-schedule"
+            )
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

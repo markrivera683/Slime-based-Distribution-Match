@@ -32,6 +32,8 @@ from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
+from .effopd import EffOPDController, EffOPDResult
+from .effopd.validate import score_from_terms, slice_rollout_data_for_indices
 from .g1_fast import compute_g1_token_advantages_from_embeddings
 from .initialize import init, is_megatron_main_rank
 from .loss import (
@@ -86,6 +88,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
         }
+        self.effopd_controller = None
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
@@ -155,6 +158,22 @@ class MegatronTrainRayActor(TrainRayActor):
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
         )
+        if getattr(self.args, "use_effopd", False):
+            self.effopd_controller = EffOPDController(
+                args=self.args,
+                source_getter=lambda: named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                    translate_gpu_to_cpu=False,
+                ),
+                backuper=self.weights_backuper,
+                optimizer=self.optimizer,
+                opt_param_scheduler=self.opt_param_scheduler,
+                validation_evaluator=self._evaluate_effopd_candidate,
+                decision_rank_getter=is_megatron_main_rank,
+            )
+            self.effopd_controller.initialise()
 
         # empty cache after initialization
         clear_memory()
@@ -409,6 +428,42 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
+    def _evaluate_effopd_candidate(self, rollout_data: RolloutBatch, dv_indices: list[int]):
+        """Score the live candidate weights on a fixed D_v subset of responses."""
+
+        if not dv_indices:
+            raise ValueError("EffOPD combined_gate requires a non-empty D_v subset.")
+        if "teacher_log_probs" not in rollout_data:
+            raise ValueError("EffOPD combined_gate requires OPD teacher_log_probs in rollout_data.")
+        if "rewards" not in rollout_data:
+            raise ValueError("EffOPD combined_gate requires G2 cf_l1oo rewards in rollout_data.")
+
+        dv_rollout_data = slice_rollout_data_for_indices(rollout_data, dv_indices)
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, dv_rollout_data)
+        candidate_outputs = self.compute_log_prob(
+            data_iterator,
+            num_microbatches,
+            store_prefix="",
+        )
+        candidate_log_probs = candidate_outputs.get("log_probs")
+        if candidate_log_probs is None:
+            if is_megatron_main_rank():
+                raise ValueError("EffOPD D_v evaluator did not produce log_probs on the decision rank.")
+            return score_from_terms(
+                self.args,
+                cf_rewards=dv_rollout_data.get("rewards"),
+                teacher_log_probs=None,
+                student_log_probs=None,
+                mode="combined_gate",
+            )
+        return score_from_terms(
+            self.args,
+            cf_rewards=dv_rollout_data.get("rewards"),
+            teacher_log_probs=dv_rollout_data.get("teacher_log_probs"),
+            student_log_probs=candidate_log_probs,
+            mode="combined_gate",
+        )
+
     def compute_g1_token_advantages(
         self,
         rollout_data: RolloutBatch,
@@ -469,6 +524,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 embeddings["g1_gt_embedding"],
                 rollout_data["response_lengths"],
                 teacher_gen_embeddings=rollout_data.get("g2_teacher_gen_embeddings"),
+                teacher_log_probs=rollout_data.get("teacher_log_probs"),
                 g2_runtime_dump_path=g2_dump_path if g2_dump_enabled else None,
                 g2_dump_writer_metadata=collect_g1_runtime_dump_writer_metadata() if g2_dump_enabled else None,
             )
@@ -635,7 +691,7 @@ class MegatronTrainRayActor(TrainRayActor):
             num_microbatches,
         )
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> dict | None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
@@ -674,7 +730,6 @@ class MegatronTrainRayActor(TrainRayActor):
                         if self.args.use_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                         self._switch_model("ref")
-                        self.compute_g2_teacher_gen_embeddings(rollout_data)
                         self.compute_g1_token_advantages(rollout_data)
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
@@ -736,6 +791,16 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
 
+        effopd_result = EffOPDResult(enabled=False)
+        if self.effopd_controller is not None:
+            with timer("effopd"):
+                effopd_result = self.effopd_controller.maybe_extrapolate(
+                    rollout_id=rollout_id,
+                    rollout_data=rollout_data,
+                )
+            if effopd_result.triggered and is_megatron_main_rank():
+                logger.info("EffOPD result at rollout_id=%s: %s", rollout_id, effopd_result.to_dict())
+
         # update the cpu actor weight to the latest model
         self.weights_backuper.backup("actor")
 
@@ -751,6 +816,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+        return {"effopd": effopd_result.to_dict()}
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
@@ -863,6 +929,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
+
+    def get_effopd_state(self) -> dict | None:
+        if self.effopd_controller is None:
+            return None
+        return self.effopd_controller.state.to_json_dict()
 
     def connect_actor_critic(
         self,

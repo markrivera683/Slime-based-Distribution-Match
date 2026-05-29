@@ -23,6 +23,23 @@ from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 logger = logging.getLogger(__name__)
 
 
+def prepare_g1_ebft_tokens_for_batch(batch: dict, args: Namespace | None) -> None:
+    """Use G1 full sequences as model input for strict EBFT actor loss batches."""
+
+    if args is None or not bool(getattr(args, "g1_use_ebft_loss", False)):
+        return
+    if getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "strict_block_source":
+        return
+
+    g1_full_sequences = batch.get("g1_full_sequences")
+    if g1_full_sequences is None:
+        return
+
+    batch["tokens"] = g1_full_sequences
+    batch["total_lengths"] = [int(seq.reshape(-1).numel()) for seq in g1_full_sequences]
+    batch["response_lengths"] = [int(getattr(args, "g1_response_length"))] * len(g1_full_sequences)
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -59,6 +76,8 @@ def get_batch(
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
+
+    prepare_g1_ebft_tokens_for_batch(batch, args)
 
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
@@ -272,6 +291,8 @@ class DataIterator:
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
+            elif key == "ebft_logprob_indexing":
+                batch[key] = vals
             else:
                 if self.micro_batch_indices is not None:
                     indices = self.micro_batch_indices[self.offset]
@@ -425,6 +446,9 @@ def log_rollout_data(
                 "dynamic_global_batch_size",
                 "g1_full_sequences",
                 "g1_qa_masks",
+                "ebft_logprob_source_rows",
+                "ebft_logprob_target_positions",
+                "ebft_logprob_indexing",
                 "g2_teacher_gen_embeddings",
                 "g2_teacher_full_sequences",
                 "g2_teacher_qa_masks",
@@ -633,16 +657,23 @@ def sync_actor_critic_data(
 
     - Values are broadcast from src=1.
     - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
-    - Standard G2 trainer-side rewards are broadcast from the frozen critic
-      (src=1) to the actor on the last pipeline stage.
+    - G2 trainer-side token advantages/rewards are broadcast from the side that
+      computed them: teacher-target G2 uses critic (src=1), no-teacher/self-target
+      G2 uses actor (src=0).
     Updates `rollout_data` in place with the synchronized tensors.
     """
     log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
     values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
-    is_standard_g2 = (
-        getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
-        and getattr(args, "cf_target_mode", None) == "teacher"
-    )
+    is_cf_l1oo = getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+    g1_sync_src = None
+    if (
+        is_cf_l1oo
+        and getattr(args, "advantage_estimator", None) == "g1"
+        and getattr(args, "g1_reward_location", None) == "trainer"
+    ):
+        # Teacher-target G2 computes trainer-side rewards on the critic side.
+        # No-teacher/self-target modes compute them on the actor/ref side.
+        g1_sync_src = 1 if getattr(args, "cf_target_mode", None) == "teacher" else 0
 
     # return when not the pp last stage
     if not values and not log_probs:
@@ -666,14 +697,20 @@ def sync_actor_critic_data(
 
     synced_g1_token_advantages = None
     synced_rewards = None
-    if is_standard_g2 and getattr(args, "advantage_estimator", None) == "g1":
+    if g1_sync_src is not None:
         if values:
             device = values[0].device
         else:
             device = log_probs[0].device
 
+        group_rank = group.rank() if group is not None else dist.get_rank()
         synced_g1_token_advantages = rollout_data.get("g1_token_advantages")
         if not synced_g1_token_advantages:
+            if group_rank == g1_sync_src:
+                raise ValueError(
+                    "G2 actor/critic sync expected g1_token_advantages on source "
+                    f"rank {g1_sync_src}, but rollout_data is missing them."
+                )
             synced_g1_token_advantages = [
                 torch.empty(int(response_length), dtype=torch.float32, device=device)
                 for response_length in rollout_data["response_lengths"]
@@ -688,10 +725,10 @@ def sync_actor_critic_data(
         ):
             if advantage.numel() != int(response_length):
                 raise ValueError(
-                    f"Standard G2 g1_token_advantages[{sample_idx}] length {advantage.numel()} "
+                    f"G2 g1_token_advantages[{sample_idx}] length {advantage.numel()} "
                     f"!= response_length {int(response_length)}"
                 )
-            handles.append(dist.broadcast(advantage, src=1, group=group, async_op=True))
+            handles.append(dist.broadcast(advantage, src=g1_sync_src, group=group, async_op=True))
 
         rewards = rollout_data.get("rewards")
         if rewards:
@@ -705,13 +742,18 @@ def sync_actor_critic_data(
             synced_rewards = [
                 torch.empty(1, dtype=torch.float32, device=device) for _ in rollout_data["response_lengths"]
             ]
+            if group_rank == g1_sync_src:
+                raise ValueError(
+                    "G2 actor/critic sync expected rewards on source "
+                    f"rank {g1_sync_src}, but rollout_data is missing them."
+                )
         if len(synced_rewards) != len(rollout_data["response_lengths"]):
             raise ValueError(
-                "Standard G2 actor/critic sync expected one reward per sample, "
+                "G2 actor/critic sync expected one reward per sample, "
                 f"got {len(synced_rewards)} for {len(rollout_data['response_lengths'])} samples."
             )
         for reward in synced_rewards:
-            handles.append(dist.broadcast(reward, src=1, group=group, async_op=True))
+            handles.append(dist.broadcast(reward, src=g1_sync_src, group=group, async_op=True))
 
     for handle in handles:
         handle.wait()

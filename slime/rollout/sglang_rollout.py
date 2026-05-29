@@ -18,6 +18,7 @@ from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_fil
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
+from slime.utils.g1_ebft_rollout_mask import build_g1_ebft_rollout_mask_contract
 from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
@@ -35,6 +36,161 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
+
+G1_EBFT_ROLLOUT_MASK_MODE_NONE = "none"
+G1_EBFT_ROLLOUT_MASK_MODE_DENSE4D = "dense4d"
+G1_EBFT_ROLLOUT_MASK_MODE_SPARSE_IR = "sparse_ir"
+G1_EBFT_ROLLOUT_SAMPLING_MODE_STANDARD = "standard"
+G1_EBFT_ROLLOUT_SAMPLING_MODE_BLOCK_SOURCE = "block_source"
+G1_EBFT_ROLLOUT_MASK_METADATA_ALIASES = {
+    "qa_values": ("g1_qa_values", "qa_values", "g1_qa_masks", "g1_qa_mask"),
+    "doc_ids": ("g1_doc_ids", "doc_ids", "g1_doc_ids_prompt", "g1_prompt_doc_ids"),
+}
+
+
+def _jsonable_ebft_payload(value: Any) -> Any:
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, tuple):
+        return [_jsonable_ebft_payload(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable_ebft_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _jsonable_ebft_payload(item) for key, item in value.items()}
+    return value
+
+
+def _get_g1_ebft_prompt_metadata(sample: Sample, name: str, prompt_length: int) -> list[Any]:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    aliases = G1_EBFT_ROLLOUT_MASK_METADATA_ALIASES[name]
+    for key in aliases:
+        value = metadata.get(key)
+        if value is not None:
+            values = value.tolist() if hasattr(value, "tolist") else list(value)
+            if len(values) != prompt_length:
+                raise ValueError(
+                    f"G1 EBFT rollout mask requires sample.metadata[{key!r}] length {prompt_length}, "
+                    f"got {len(values)}"
+                )
+            return values
+    raise ValueError(
+        "G1 EBFT rollout mask requires prompt metadata "
+        f"{name!r}; expected one of sample.metadata keys {aliases}"
+    )
+
+
+def _validate_g1_ebft_block_source_runtime_args(args: Namespace, mask_mode: str) -> None:
+    expected_backend = {
+        G1_EBFT_ROLLOUT_MASK_MODE_DENSE4D: "torch_native",
+        G1_EBFT_ROLLOUT_MASK_MODE_SPARSE_IR: "triton",
+    }[mask_mode]
+    if getattr(args, "sglang_attention_backend", None) != expected_backend:
+        raise ValueError(
+            "--g1-ebft-rollout-sampling-mode block_source with "
+            f"{mask_mode} requires --sglang-attention-backend {expected_backend}"
+        )
+    if not bool(getattr(args, "sglang_disable_overlap_schedule", False)):
+        raise ValueError(
+            "--g1-ebft-rollout-sampling-mode block_source requires --sglang-disable-overlap-schedule"
+        )
+
+
+def _build_g1_ebft_rollout_mask_payload_fields(
+    args: Namespace,
+    sample: Sample,
+    *,
+    input_ids: list[int],
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    mode = getattr(args, "g1_ebft_rollout_mask_mode", G1_EBFT_ROLLOUT_MASK_MODE_NONE)
+    sampling_mode = getattr(args, "g1_ebft_rollout_sampling_mode", G1_EBFT_ROLLOUT_SAMPLING_MODE_STANDARD)
+    if mode == G1_EBFT_ROLLOUT_MASK_MODE_NONE:
+        if sampling_mode == G1_EBFT_ROLLOUT_SAMPLING_MODE_BLOCK_SOURCE:
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--g1-ebft-rollout-mask-mode dense4d or sparse_ir"
+            )
+        return {}
+    if mode not in {G1_EBFT_ROLLOUT_MASK_MODE_DENSE4D, G1_EBFT_ROLLOUT_MASK_MODE_SPARSE_IR}:
+        raise ValueError(f"Unsupported --g1-ebft-rollout-mask-mode {mode!r}")
+    if sampling_mode != G1_EBFT_ROLLOUT_SAMPLING_MODE_BLOCK_SOURCE:
+        raise ValueError(
+            "--g1-ebft-rollout-mask-mode is transport only and requires "
+            "--g1-ebft-rollout-sampling-mode block_source; mask transport alone is not strict EBFT rollout"
+        )
+    _validate_g1_ebft_block_source_runtime_args(args, mode)
+    if getattr(args, "g1_ebft_logprob_indexing", None) != "strict_block_source":
+        raise ValueError("--g1-ebft-rollout-mask-mode requires --g1-ebft-logprob-indexing strict_block_source")
+    if not bool(getattr(args, "g1_use_ebft_loss", False)):
+        raise ValueError("--g1-ebft-rollout-mask-mode requires --g1-use-ebft-loss")
+    if sample.response_length != 0 or sample.response:
+        raise ValueError("G1 EBFT rollout mask mode only supports first-turn single /generate requests")
+
+    prompt_length = int(getattr(args, "g1_prompt_length"))
+    response_length = int(getattr(args, "g1_response_length"))
+    if len(input_ids) != prompt_length:
+        raise ValueError(
+            "G1 EBFT rollout mask input_ids length must match --g1-prompt-length "
+            f"({len(input_ids)} != {prompt_length})"
+        )
+    if int(max_new_tokens) != response_length:
+        raise ValueError(
+            "G1 EBFT rollout mask requires max_new_tokens == --g1-response-length "
+            f"({max_new_tokens} != {response_length})"
+        )
+
+    qa_values = _get_g1_ebft_prompt_metadata(sample, "qa_values", prompt_length)
+    doc_ids = _get_g1_ebft_prompt_metadata(sample, "doc_ids", prompt_length)
+    contract = build_g1_ebft_rollout_mask_contract(
+        prompt_length=prompt_length,
+        context_length=int(getattr(args, "g1_context_length")),
+        generate_length=int(getattr(args, "g1_generate_length")),
+        stride=int(getattr(args, "g1_stride")),
+        qa_values=qa_values,
+        doc_ids=doc_ids,
+        document_masking=bool(getattr(args, "g1_document_masking", False)),
+    )
+    if contract.response_length != response_length:
+        raise ValueError(
+            "G1 EBFT rollout mask geometry response length mismatch "
+            f"({contract.response_length} != {response_length})"
+        )
+
+    fields: dict[str, Any] = {
+        "ebft_rollout_sampling_mode": G1_EBFT_ROLLOUT_SAMPLING_MODE_BLOCK_SOURCE,
+        "ebft_mask_spec": contract.to_mask_spec(mode=mode),
+        "ebft_position_ids": contract.position_ids,
+    }
+    if mode == G1_EBFT_ROLLOUT_MASK_MODE_DENSE4D:
+        fields["ebft_dense_attention_mask"] = contract.to_dense_additive_mask()
+    else:
+        fields["ebft_sparse_ir"] = contract.to_span_sparse_ir()
+    return _jsonable_ebft_payload(fields)
+
+
+def _force_no_early_stop_for_ebft_block_source(args: Namespace, sampling_params: dict[str, Any]) -> None:
+    if (
+        getattr(args, "g1_ebft_rollout_sampling_mode", G1_EBFT_ROLLOUT_SAMPLING_MODE_STANDARD)
+        != G1_EBFT_ROLLOUT_SAMPLING_MODE_BLOCK_SOURCE
+    ):
+        return
+    sampling_params["ignore_eos"] = True
+    sampling_params["stop"] = []
+    sampling_params["stop_token_ids"] = []
+
+
+def _trim_text_for_rollout_log(text: str, *, max_chars: int = 1600) -> str:
+    for marker in ("<|im_end|>", "<|endoftext|>"):
+        marker_idx = text.find(marker)
+        if marker_idx >= 0:
+            return text[: marker_idx + len(marker)] + " ...[trimmed after stop marker]"
+    if len(text) > max_chars:
+        return text[:max_chars] + f" ...[trimmed {len(text) - max_chars} chars]"
+    return text
+
+
+def _format_sample_for_rollout_log(sample: Sample) -> str:
+    return _trim_text_for_rollout_log(str(sample.prompt) + sample.response)
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
@@ -140,6 +296,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if sampling_params["max_new_tokens"] == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
+    _force_no_early_stop_for_ebft_block_source(args, sampling_params)
 
     # Prepare payload for sglang server
     payload = {
@@ -159,6 +316,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if len(sample.response) > 0:
         payload["input_ids"] = sample.tokens
     elif has_multimodal:
+        if (
+            getattr(args, "g1_ebft_rollout_mask_mode", G1_EBFT_ROLLOUT_MASK_MODE_NONE)
+            != G1_EBFT_ROLLOUT_MASK_MODE_NONE
+        ):
+            raise ValueError("G1 EBFT rollout mask mode does not support multimodal text/image payloads")
         # For multimodal first-turn: send text so SGLang handles image token
         # expansion internally (the processor-expanded input_ids have N patch
         # tokens per image which would mismatch the image_data count).
@@ -169,6 +331,16 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         payload["input_ids"] = prompt_ids
         if not sample.tokens:  # Initialize sample.tokens for the first turn
             sample.tokens = prompt_ids
+
+    if "input_ids" in payload:
+        payload.update(
+            _build_g1_ebft_rollout_mask_payload_fields(
+                args,
+                sample,
+                input_ids=payload["input_ids"],
+                max_new_tokens=sampling_params["max_new_tokens"],
+            )
+        )
 
     # Use session_id for consistent hashing routing (SGLang Model Gateway)
     headers = None
@@ -335,7 +507,9 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1"):
+    if getattr(args, "sglang_direct_worker_mode", False):
+        urls = [f"http://{args.sglang_router_ip}:{args.sglang_router_port}"]
+    elif parse(sglang_router.__version__) <= parse("0.2.1"):
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
         urls = response["urls"]
     else:
@@ -419,7 +593,11 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    "First rollout sample: %s, label: %s, reward: %s, response_len: %s",
+                    [_format_sample_for_rollout_log(sample)],
+                    str(sample.label)[:100],
+                    sample.reward,
+                    sample.response_length,
                 )
                 do_print = False
 
@@ -440,7 +618,11 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        "Finish rollout: %s, label: %s, reward: %s, response_len: %s",
+        [_format_sample_for_rollout_log(sample)],
+        str(sample.label)[:100],
+        sample.reward,
+        sample.response_length,
     )
 
     # there are still some unfinished requests, abort them

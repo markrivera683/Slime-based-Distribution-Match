@@ -558,7 +558,13 @@ def train_one_step(
             "teacher_log_probs",
         ]
         if bool(getattr(args, "g1_use_ebft_loss", False)):
-            for key in ("g1_full_sequences", "g1_qa_masks"):
+            for key in (
+                "g1_full_sequences",
+                "g1_qa_masks",
+                "ebft_logprob_source_rows",
+                "ebft_logprob_target_positions",
+                "ebft_logprob_indexing",
+            ):
                 if key not in batch_keys:
                     batch_keys.append(key)
 

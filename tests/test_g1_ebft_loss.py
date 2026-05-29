@@ -459,6 +459,199 @@ def test_thd_full_sequence_logprob_gather_returns_1d_samples(monkeypatch) -> Non
     assert outs[0].shape == (3,)
 
 
+def test_thd_pair_axis_logprob_gather_uses_strict_source_rows(monkeypatch) -> None:
+    megatron_loss = pytest.importorskip(
+        "slime.backends.megatron_utils.loss",
+        reason="Megatron dependency is not available in this environment.",
+    )
+    monkeypatch.setattr(megatron_loss.mpu, "get_tensor_model_parallel_group", lambda: None)
+
+    def fake_calc(logits_chunk, tokens_targets, tp_group, with_entropy=False, chunk_size=None):
+        del tp_group, with_entropy, chunk_size
+        return logits_chunk.gather(dim=-1, index=tokens_targets.reshape(-1, 1)).reshape(-1, 1), None
+
+    monkeypatch.setattr(megatron_loss, "calculate_log_probs_and_entropy", fake_calc)
+
+    vocab_size = 32
+    total_len = 10
+    logits = torch.zeros(1, total_len, vocab_size, dtype=torch.float32)
+    for row in range(total_len):
+        for token in range(vocab_size):
+            logits[0, row, token] = row * 1000 + token
+    tokens = torch.tensor([0, 1, 2, 3, 4, 5, 10, 20, 11, 21], dtype=torch.long)
+    args = type("Args", (), {"qkv_format": "thd", "rollout_temperature": 1.0, "log_probs_chunk_size": 0})()
+
+    strict_out = megatron_loss.thd_packed_pair_axis_log_probs_from_logits(
+        logits,
+        args=args,
+        unconcat_tokens=[tokens],
+        total_lengths=[total_len],
+        per_sample_source_rows=[torch.tensor([0, 1, 2, 3, 4, 1, 3, 6, 7])],
+        per_sample_target_positions=[torch.arange(1, total_len)],
+    )[0]
+    standard_out = megatron_loss.thd_packed_pair_axis_log_probs_from_logits(
+        logits,
+        args=args,
+        unconcat_tokens=[tokens],
+        total_lengths=[total_len],
+        per_sample_source_rows=[torch.arange(total_len - 1)],
+        per_sample_target_positions=[torch.arange(1, total_len)],
+    )[0]
+
+    torch.testing.assert_close(strict_out, torch.tensor([1, 1002, 2003, 3004, 4005, 1010, 3020, 6011, 7021.0]))
+    torch.testing.assert_close(standard_out, torch.tensor([1, 1002, 2003, 3004, 4005, 5010, 6020, 7011, 8021.0]))
+    assert not torch.equal(strict_out[-4:], standard_out[-4:])
+
+
+def test_g1_ebft_policy_loss_dispatches_logprob_indexing(monkeypatch) -> None:
+    megatron_loss = pytest.importorskip(
+        "slime.backends.megatron_utils.loss",
+        reason="Megatron dependency is not available in this environment.",
+    )
+    monkeypatch.setattr(megatron_loss.mpu, "get_context_parallel_world_size", lambda: 1)
+
+    called = []
+
+    def fake_standard(*args, **kwargs):
+        del args, kwargs
+        called.append("standard")
+        return [torch.zeros(3, dtype=torch.float32)]
+
+    def fake_strict(*args, **kwargs):
+        del args, kwargs
+        called.append("strict")
+        return [torch.ones(3, dtype=torch.float32)]
+
+    def fake_mean(*, per_sample_log_probs_next, **kwargs):
+        return per_sample_log_probs_next[0].sum(), per_sample_log_probs_next[0].sum() + 1
+
+    monkeypatch.setattr(megatron_loss, "thd_packed_full_sequence_next_log_probs_from_logits", fake_standard)
+    monkeypatch.setattr(megatron_loss, "thd_packed_pair_axis_log_probs_from_logits", fake_strict)
+    monkeypatch.setattr(megatron_loss, "ebft_mean_rl_ce_over_packed_samples", fake_mean)
+
+    base_args = {
+        "qkv_format": "thd",
+        "allgather_cp": False,
+        "advantage_estimator": "g1",
+        "loss_type": "policy_loss",
+        "use_opsm": False,
+        "entropy_coef": 0.0,
+        "g1_qa_masking": True,
+        "g1_ce_loss_coef": 0.03,
+        "g1_prompt_length": 2,
+        "g1_context_length": 1,
+        "g1_generate_length": 1,
+        "g1_stride": 1,
+        "g1_response_length": 1,
+    }
+    batch = {
+        "unconcat_tokens": [torch.tensor([5, 6, 7])],
+        "total_lengths": [3],
+        "response_lengths": [1],
+        "ebft_action_mask_next": [torch.tensor([False, True, True])],
+        "ebft_qa_mask_next": [torch.tensor([True, True, True])],
+        "ebft_advantages_next": [torch.zeros(3)],
+        "ebft_logprob_source_rows": [torch.tensor([0, 0, 1])],
+        "ebft_logprob_target_positions": [torch.tensor([1, 2, 2])],
+    }
+    logits = torch.zeros(1, 3, 8, dtype=torch.float32)
+
+    args_default = type("Args", (), base_args)()
+    loss_default, metrics_default = megatron_loss.policy_loss_function_g1_ebft(
+        args_default,
+        batch,
+        logits,
+        lambda x: x,
+    )
+    assert called[-1] == "standard"
+    torch.testing.assert_close(loss_default, torch.tensor(0.03))
+    torch.testing.assert_close(metrics_default["pg_loss"], torch.tensor(0.0))
+
+    args_standard = type("Args", (), {**base_args, "g1_ebft_logprob_indexing": "standard_next_token"})()
+    loss_standard, metrics_standard = megatron_loss.policy_loss_function_g1_ebft(
+        args_standard,
+        batch,
+        logits,
+        lambda x: x,
+    )
+    assert called[-1] == "standard"
+    torch.testing.assert_close(loss_standard, torch.tensor(0.03))
+    torch.testing.assert_close(metrics_standard["pg_loss"], torch.tensor(0.0))
+
+    args_strict = type("Args", (), {**base_args, "g1_ebft_logprob_indexing": "strict_block_source"})()
+    loss_strict, metrics_strict = megatron_loss.policy_loss_function_g1_ebft(
+        args_strict,
+        batch,
+        logits,
+        lambda x: x,
+    )
+    assert called[-1] == "strict"
+    torch.testing.assert_close(loss_strict, torch.tensor(3.12))
+    torch.testing.assert_close(metrics_strict["pg_loss"], torch.tensor(3.0))
+
+
+def test_g1_ebft_policy_loss_strict_metadata_drives_action_gradients(monkeypatch) -> None:
+    megatron_loss = pytest.importorskip(
+        "slime.backends.megatron_utils.loss",
+        reason="Megatron dependency is not available in this environment.",
+    )
+    monkeypatch.setattr(megatron_loss.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(megatron_loss.mpu, "get_tensor_model_parallel_group", lambda: None)
+
+    def fake_calc(logits_chunk, tokens_targets, tp_group, with_entropy=False, chunk_size=None):
+        del tp_group, with_entropy, chunk_size
+        return logits_chunk.gather(dim=-1, index=tokens_targets.reshape(-1, 1)).reshape(-1, 1), None
+
+    monkeypatch.setattr(megatron_loss, "calculate_log_probs_and_entropy", fake_calc)
+
+    args = type(
+        "Args",
+        (),
+        {
+            "qkv_format": "thd",
+            "allgather_cp": False,
+            "advantage_estimator": "g1",
+            "loss_type": "policy_loss",
+            "use_opsm": False,
+            "entropy_coef": 0.0,
+            "g1_qa_masking": True,
+            "g1_ce_loss_coef": 0.0,
+            "g1_prompt_length": 6,
+            "g1_context_length": 2,
+            "g1_generate_length": 2,
+            "g1_stride": 2,
+            "g1_response_length": 4,
+            "g1_ebft_logprob_indexing": "strict_block_source",
+            "rollout_temperature": 1.0,
+            "log_probs_chunk_size": 0,
+        },
+    )()
+    tokens = torch.tensor([0, 1, 2, 3, 4, 5, 10, 20, 11, 21], dtype=torch.long)
+    logits = torch.zeros(1, 10, 32, dtype=torch.float32, requires_grad=True)
+    batch = {
+        "unconcat_tokens": [tokens],
+        "total_lengths": [10],
+        "response_lengths": [4],
+        "ebft_action_mask_next": [torch.tensor([False, False, False, False, False, True, True, True, True])],
+        "ebft_qa_mask_next": [torch.tensor([False, False, False, False, False, True, True, True, True])],
+        "ebft_advantages_next": [torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0])],
+        "ebft_logprob_source_rows": [torch.tensor([0, 1, 2, 3, 4, 1, 3, 6, 7])],
+        "ebft_logprob_target_positions": [torch.arange(1, 10)],
+    }
+
+    loss, metrics = megatron_loss.policy_loss_function_g1_ebft(args, batch, logits, lambda x: x)
+    loss.backward()
+
+    torch.testing.assert_close(metrics["pg_loss"], torch.tensor(-2.5))
+    expected_grad = torch.zeros_like(logits)
+    expected_grad[0, 1, 10] = -0.25
+    expected_grad[0, 3, 20] = -0.5
+    expected_grad[0, 6, 11] = -0.75
+    expected_grad[0, 7, 21] = -1.0
+    torch.testing.assert_close(logits.grad, expected_grad)
+    torch.testing.assert_close(loss.detach(), torch.tensor(-2.5))
+
+
 def test_optional_openrlhf_ebft_policy_loss_matches_slime_packed_golden_fixture() -> None:
     """When OpenRLHF is available, compare its actor loss to Slime on the exact same fixture."""
 

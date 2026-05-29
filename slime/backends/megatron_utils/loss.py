@@ -25,6 +25,8 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.g1_ebft_loss import (
     G1_EBFT_ACTOR_LOSS_DUMP_ENV,
+    G1_EBFT_LOGPROB_INDEXING_STANDARD,
+    G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK,
     ebft_mean_rl_ce_over_packed_samples,
     maybe_dump_ebft_actor_loss_runtime,
 )
@@ -593,16 +595,34 @@ def get_g1_embeddings_from_hidden_states(
     }
 
 
+def _resolve_opd_kl_application(args: Namespace) -> str:
+    application = str(getattr(args, "opd_kl_application", "auto"))
+    if application == "auto":
+        if (
+            getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
+            and getattr(args, "cf_target_mode", None) == "opd_onpolicy"
+        ):
+            return "cf_l1oo"
+        return "token_penalty"
+    if application not in {"token_penalty", "cf_l1oo", "both"}:
+        raise ValueError(
+            f"Unsupported --opd-kl-application {application!r}; "
+            "expected auto, token_penalty, cf_l1oo, or both."
+        )
+    return application
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
 ) -> None:
-    """Apply on-policy distillation KL penalty to advantages.
+    """Compute OPD reverse-KL metrics and optionally apply token KL penalty.
 
-    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
-    to advantages in-place. This is orthogonal to the base advantage estimator.
+    In OPD-CF-L1OO mode, the teacher signal is already converted into
+    precomputed token advantages, so the default behavior records reverse-KL
+    metrics without subtracting the tokenwise KL again.
 
     Args:
         args: Configuration containing `use_opd` and `opd_kl_coef`.
@@ -627,7 +647,8 @@ def apply_opd_kl_to_advantages(
     reverse_kls = []
     for i, adv in enumerate(advantages):
         reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
+        if _resolve_opd_kl_application(args) in {"token_penalty", "both"}:
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 
     # Store reverse KL for logging
@@ -882,6 +903,19 @@ def _assert_g1_ebft_environment(args: Namespace) -> None:
         errs.append("allgather_cp is incompatible with --g1-use-ebft-loss until full-sequence log-prob plumbing lands")
     if args.advantage_estimator != "g1":
         errs.append("advantage_estimator must be g1")
+    if getattr(args, "g1_ebft_logprob_indexing", G1_EBFT_LOGPROB_INDEXING_STANDARD) == G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK:
+        prompt_len = int(getattr(args, "g1_prompt_length", 0))
+        context_len = int(getattr(args, "g1_context_length", 0))
+        generate_len = int(getattr(args, "g1_generate_length", 0))
+        stride = int(getattr(args, "g1_stride", 0))
+        response_len = int(getattr(args, "g1_response_length", 0))
+        remainder = prompt_len - generate_len - context_len
+        if context_len < 1 or stride <= 0 or remainder < 0 or remainder % stride != 0:
+            errs.append("strict_block_source requires valid G1 block geometry")
+        else:
+            num_blocks = remainder // stride + 1
+            if response_len != generate_len * num_blocks:
+                errs.append("strict_block_source requires g1_response_length == g1_generate_length * num_blocks")
     if args.loss_type != "policy_loss":
         errs.append("loss_type must be policy_loss")
     if args.use_opsm:
@@ -947,6 +981,84 @@ def thd_packed_full_sequence_next_log_probs_from_logits(
     return outs
 
 
+def thd_packed_pair_axis_log_probs_from_logits(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    per_sample_source_rows: list[torch.Tensor],
+    per_sample_target_positions: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Gather per-sample log-probs from explicit source row -> target token pairs."""
+
+    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    if args.qkv_format != "thd":
+        raise ValueError("thd_packed_pair_axis_log_probs_from_logits expects qkv_format thd")
+    n = len(unconcat_tokens)
+    if not (n == len(total_lengths) == len(per_sample_source_rows) == len(per_sample_target_positions)):
+        raise ValueError("Mismatched per-sample pair-axis tensor list lengths")
+
+    lf = logits.squeeze(0)
+
+    # Keep consistent with slime response log-prob path (see ``get_responses``).
+    if args.rollout_temperature != 1.0:
+        lf = lf.div(args.rollout_temperature)
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    outs: list[torch.Tensor] = []
+    seq_cursor = 0
+
+    for tokens, total_len, source_rows, target_positions in zip(
+        unconcat_tokens,
+        total_lengths,
+        per_sample_source_rows,
+        per_sample_target_positions,
+        strict=True,
+    ):
+        total_len_int = int(total_len)
+        toks = tokens.reshape(-1)[:total_len_int]
+        if int(toks.numel()) != total_len_int:
+            raise ValueError("token/tensor length mismatch in EBFT pair-axis logprob gather")
+        if total_len_int < 2:
+            raise ValueError("--g1-use-ebft-loss requires sequences with length >= 2")
+
+        src = source_rows.to(device=lf.device, dtype=torch.long).reshape(-1)
+        tgt_pos = target_positions.to(device=toks.device, dtype=torch.long).reshape(-1)
+        if src.numel() != tgt_pos.numel():
+            raise ValueError(f"source/target pair-axis length mismatch: {src.numel()} != {tgt_pos.numel()}")
+        if src.numel() != total_len_int - 1:
+            raise ValueError(
+                f"pair-axis length {src.numel()} != full sequence next-token length {total_len_int - 1}"
+            )
+        if src.numel() == 0:
+            outs.append(lf.new_empty((0,)))
+            seq_cursor += total_len_int
+            continue
+        if int(src.min().item()) < 0 or int(src.max().item()) >= total_len_int:
+            raise ValueError("EBFT pair-axis source rows out of sample-local bounds")
+        if int(tgt_pos.min().item()) < 0 or int(tgt_pos.max().item()) >= total_len_int:
+            raise ValueError("EBFT pair-axis target positions out of sample-local bounds")
+
+        logits_chunk = lf[seq_cursor + src]
+        tokens_targets = toks[tgt_pos]
+
+        lp, _ = calculate_log_probs_and_entropy(
+            logits_chunk,
+            tokens_targets,
+            tp_group,
+            with_entropy=False,
+            chunk_size=args.log_probs_chunk_size,
+        )
+        outs.append(lp.reshape(-1))
+        seq_cursor += total_len_int
+
+    if seq_cursor > int(lf.shape[0]):
+        raise ValueError("EBFT pair-axis logprob gather overran packed logits stream")
+
+    return outs
+
+
 def policy_loss_function_g1_ebft(
     args: Namespace,
     batch: RolloutBatch,
@@ -971,12 +1083,30 @@ def policy_loss_function_g1_ebft(
 
     qa_masking = bool(getattr(args, "g1_qa_masking", False))
 
-    lp_per_sample = thd_packed_full_sequence_next_log_probs_from_logits(
-        logits,
-        args=args,
-        unconcat_tokens=batch["unconcat_tokens"],
-        total_lengths=batch["total_lengths"],
-    )
+    logprob_indexing = getattr(args, "g1_ebft_logprob_indexing", G1_EBFT_LOGPROB_INDEXING_STANDARD)
+    if logprob_indexing == G1_EBFT_LOGPROB_INDEXING_STRICT_BLOCK:
+        pair_missing = [k for k in ("ebft_logprob_source_rows", "ebft_logprob_target_positions") if k not in batch]
+        if pair_missing:
+            raise ValueError(
+                f"strict G1 EBFT logprob indexing requires `{pair_missing}` populated on the Megatron batch"
+            )
+        lp_per_sample = thd_packed_pair_axis_log_probs_from_logits(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            per_sample_source_rows=batch["ebft_logprob_source_rows"],
+            per_sample_target_positions=batch["ebft_logprob_target_positions"],
+        )
+    elif logprob_indexing == G1_EBFT_LOGPROB_INDEXING_STANDARD:
+        lp_per_sample = thd_packed_full_sequence_next_log_probs_from_logits(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+        )
+    else:
+        raise ValueError(f"Unsupported g1_ebft_logprob_indexing: {logprob_indexing!r}")
 
     if len(lp_per_sample) != len(batch["ebft_action_mask_next"]):
         raise ValueError("Per-sample EBFT log-prob gather count mismatched ebft tensors")
@@ -1031,6 +1161,7 @@ def policy_loss_function_g1_ebft(
                 "total_lengths": [int(x) for x in batch["total_lengths"]],
                 "response_lengths": [int(x) for x in batch.get("response_lengths", [])],
                 "seq_len_m1": [int(x) for x in batch.get("ebft_seq_len_m1", [])],
+                "g1_ebft_logprob_indexing": logprob_indexing,
             },
         )
 
