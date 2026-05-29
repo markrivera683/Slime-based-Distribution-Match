@@ -23,9 +23,24 @@ export BASE_DIR="${BASE_DIR:-/root/slime_runtime}"
 export VENV_DIR="${VENV_DIR:-/root/venvs/slime}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export RECREATE_VENV="${RECREATE_VENV:-false}"
-export SGLANG_COMMIT="${SGLANG_COMMIT:-bbe9c7eeb520b0a67e92d133dfc137a3688dc7f2}"
+export SGLANG_PROFILE="${SGLANG_PROFILE:-ebft_block_source}"
+case "${SGLANG_PROFILE}" in
+  ebft_block_source)
+    _sglang_profile_repo="https://github.com/markrivera683/sglang_ebft.git"
+    _sglang_profile_commit="d3b72348ebaa32903dd9392d4e9deb8e3dd08498"
+    ;;
+  upstream)
+    _sglang_profile_repo="https://github.com/sgl-project/sglang.git"
+    _sglang_profile_commit="bbe9c7eeb520b0a67e92d133dfc137a3688dc7f2"
+    ;;
+  *)
+    echo "[ERROR] unknown SGLANG_PROFILE=${SGLANG_PROFILE}; expected ebft_block_source or upstream" >&2
+    exit 1
+    ;;
+esac
+export SGLANG_REPO="${SGLANG_REPO:-${_sglang_profile_repo}}"
+export SGLANG_COMMIT="${SGLANG_COMMIT:-${_sglang_profile_commit}}"
 export MEGATRON_COMMIT="${MEGATRON_COMMIT:-3714d81d418c9f1bca4594fc35f9e8289f652862}"
-export SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
 export MEGATRON_REPO="${MEGATRON_REPO:-https://github.com/NVIDIA/Megatron-LM.git}"
 export SLIME_DIR="${SLIME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)}"
 export PIP_INDEX_URL="${PIP_INDEX_URL:-http://mirrors.cloud.aliyuncs.com/pypi/simple/}"
@@ -62,6 +77,10 @@ if [[ ! -f "${SLIME_DIR}/train.py" ]]; then
   echo "[ERROR] local slime source not found under SLIME_DIR=${SLIME_DIR}" >&2
   exit 1
 fi
+
+echo "[sglang] profile=${SGLANG_PROFILE}"
+echo "[sglang] repo=${SGLANG_REPO}"
+echo "[sglang] commit=${SGLANG_COMMIT}"
 
 if [[ "${RECREATE_VENV}" == "true" && -d "${VENV_DIR}" ]]; then
   echo "[venv] removing existing venv to avoid stale torch/cuda extension ABI mismatches: ${VENV_DIR}"
@@ -235,6 +254,18 @@ clone_or_update() {
     else
       git clone "${repo}" "${dest}"
     fi
+  else
+    cd "${dest}"
+    local current_origin
+    current_origin="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ "${current_origin}" != "${repo}" ]]; then
+      echo "[git] updating origin for ${dest}: ${current_origin:-<none>} -> ${repo}"
+      if [[ -n "${current_origin}" ]]; then
+        git remote set-url origin "${repo}"
+      else
+        git remote add origin "${repo}"
+      fi
+    fi
   fi
   cd "${dest}"
   git fetch --all --tags
@@ -403,6 +434,9 @@ export PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST}"
 export PIP_RETRIES="${PIP_RETRIES}"
 export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT}"
 export PIP_DISABLE_PIP_VERSION_CHECK="${PIP_DISABLE_PIP_VERSION_CHECK}"
+export SGLANG_PROFILE="${SGLANG_PROFILE}"
+export SGLANG_REPO="${SGLANG_REPO}"
+export SGLANG_COMMIT="${SGLANG_COMMIT}"
 export MEGATRON_PATH="${BASE_DIR}/Megatron-LM"
 export SLIME_ROOT="${SLIME_DIR}"
 export PYTHONPATH="${BASE_DIR}/Megatron-LM:${SLIME_DIR}:\${PYTHONPATH:-}"
