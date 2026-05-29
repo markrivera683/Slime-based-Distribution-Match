@@ -141,12 +141,29 @@ def test_g2_opd_cf_l1oo_launchers_print_blockwise_flags(script: Path, launcher_e
         "[preflight] G1_EBFT_LOGPROB_INDEXING=strict_block_source "
         "G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir"
     ) in output
+    if script.name.endswith("_1node8.sh"):
+        assert "[layout] teacher CUDA_VISIBLE_DEVICES=0,1,2,3 NUM_GPUS=4 EXPECTED_TEACHER_GPUS=4" in output
+        assert "[layout] student/Ray CUDA_VISIBLE_DEVICES=4,5,6,7 NUM_GPUS=4 EXPECTED_STUDENT_GPUS=4" in output
+        assert "[layout] Ray/NUM_GPUS=4" in output
+        assert "[preflight] RAY_NUM_GPUS=4 NUM_GPUS=4" in output
+        assert "[submit] student CUDA_VISIBLE_DEVICES=4,5,6,7" in output
 
     run_context = Path(launcher_env["ARTIFACT_DIR"]) / "run_context.env"
     context = run_context.read_text(encoding="utf-8")
+    context_lines = set(context.splitlines())
     assert "G1_EBFT_LOGPROB_INDEXING=strict_block_source" in context
     assert "G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source" in context
     assert "G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir" in context
     assert "SGLANG_ATTENTION_BACKEND=triton" in context
     assert "SGLANG_DISABLE_OVERLAP_SCHEDULE=true" in context
     assert "SGLANG_GRAMMAR_BACKEND=none" in context
+    if script.name.endswith("_1node8.sh"):
+        assert "TEACHER_CUDA_VISIBLE_DEVICES=0,1,2,3" in context_lines
+        assert "TEACHER_NUM_GPUS=4" in context_lines
+        assert "EXPECTED_TEACHER_GPUS=4" in context_lines
+        assert "STUDENT_CUDA_VISIBLE_DEVICES=4,5,6,7" in context_lines
+        assert "STUDENT_NUM_GPUS=4" in context_lines
+        assert "EXPECTED_STUDENT_GPUS=4" in context_lines
+        assert "CUDA_VISIBLE_DEVICES=4,5,6,7" in context_lines
+        assert "NUM_GPUS=4" in context_lines
+        assert "RAY_NUM_GPUS=4" in context_lines

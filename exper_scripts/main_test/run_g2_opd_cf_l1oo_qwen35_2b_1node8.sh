@@ -65,6 +65,7 @@ TEACHER_POLL_SECONDS="${TEACHER_POLL_SECONDS:-10}"
 TEACHER_BIND_HOST="${TEACHER_BIND_HOST:-${TEACHER_HOST}}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/mnt/data/models/Qwen3.5-27B}"
 TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+EXPECTED_TEACHER_GPUS="${EXPECTED_TEACHER_GPUS:-4}"
 TEACHER_TP_SIZE="${TEACHER_TP_SIZE:-2}"
 TEACHER_DP_SIZE="${TEACHER_DP_SIZE:-2}"
 TEACHER_CONTEXT_LENGTH="${TEACHER_CONTEXT_LENGTH:-2048}"
@@ -72,9 +73,11 @@ TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.55}"
 TEACHER_MAX_RUNNING_REQUESTS="${TEACHER_MAX_RUNNING_REQUESTS:-}"
 TEACHER_EXTRA_SGLANG_ARGS="${TEACHER_EXTRA_SGLANG_ARGS:---disable-cuda-graph --attention-backend triton --sampling-backend pytorch}"
 STUDENT_CUDA_VISIBLE_DEVICES="${STUDENT_CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+EXPECTED_STUDENT_GPUS="${EXPECTED_STUDENT_GPUS:-4}"
 
-# Student sees four GPUs; teacher runs as a separate local SGLang process.
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${STUDENT_CUDA_VISIBLE_DEVICES}}"
+# Student/Ray always use the explicit student split; inherited
+# CUDA_VISIBLE_DEVICES must not desync Ray --num-gpus from visible devices.
+CUDA_VISIBLE_DEVICES="${STUDENT_CUDA_VISIBLE_DEVICES}"
 TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-2}"
 PIPELINE_MODEL_PARALLEL_SIZE="${PIPELINE_MODEL_PARALLEL_SIZE:-1}"
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
@@ -262,6 +265,9 @@ if [[ -f "${SLIME_ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${SLIME_ENV_FILE}"
 fi
+STUDENT_CUDA_VISIBLE_DEVICES="${STUDENT_CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+CUDA_VISIBLE_DEVICES="${STUDENT_CUDA_VISIBLE_DEVICES}"
+export CUDA_VISIBLE_DEVICES
 
 # DLC/DSW images commonly export HTTP_PROXY/HTTPS_PROXY. SGLang's Rust router
 # honors those variables for its worker health probes, so local/Ray node IPs
@@ -498,6 +504,20 @@ require_dir() {
   [[ -d "$1" ]] || { echo "[ERROR] required directory missing: $1" >&2; exit 1; }
 }
 
+count_csv() {
+  local csv="$1"
+  local count=0
+  local item
+  IFS=',' read -ra items <<<"${csv}"
+  for item in "${items[@]}"; do
+    item="${item//[[:space:]]/}"
+    if [[ -n "${item}" ]]; then
+      count=$((count + 1))
+    fi
+  done
+  printf "%s\n" "${count}"
+}
+
 require_positive_int() {
   local name="$1"
   local value="$2"
@@ -696,12 +716,32 @@ if [[ "${ENABLE_G2_POST_EVAL}" == "true" ]]; then
   require_file "${HUMANEVAL_EVAL_DATA}"
 fi
 
-NUM_GPUS="$("${PYTHON_BIN}" - <<'PY'
-import os
-print(len([x for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",") if x.strip()]))
-PY
-)"
+TEACHER_NUM_GPUS="$(count_csv "${TEACHER_CUDA_VISIBLE_DEVICES}")"
+STUDENT_NUM_GPUS="$(count_csv "${STUDENT_CUDA_VISIBLE_DEVICES}")"
+NUM_GPUS="${STUDENT_NUM_GPUS}"
+RAY_NUM_GPUS="${NUM_GPUS}"
+require_positive_int "TEACHER_NUM_GPUS" "${TEACHER_NUM_GPUS}"
+if [[ "${EXPECTED_TEACHER_GPUS}" != "0" ]]; then
+  require_positive_int "EXPECTED_TEACHER_GPUS" "${EXPECTED_TEACHER_GPUS}"
+  if (( TEACHER_NUM_GPUS != EXPECTED_TEACHER_GPUS )); then
+    echo "[ERROR] teacher expected ${EXPECTED_TEACHER_GPUS} visible GPUs, got ${TEACHER_NUM_GPUS}: ${TEACHER_CUDA_VISIBLE_DEVICES}" >&2
+    echo "[ERROR] Set EXPECTED_TEACHER_GPUS=0 to bypass this check for debugging." >&2
+    exit 1
+  fi
+fi
 require_positive_int "NUM_GPUS" "${NUM_GPUS}"
+if [[ "${EXPECTED_STUDENT_GPUS}" != "0" ]]; then
+  require_positive_int "EXPECTED_STUDENT_GPUS" "${EXPECTED_STUDENT_GPUS}"
+  if (( NUM_GPUS != EXPECTED_STUDENT_GPUS )); then
+    echo "[ERROR] student/Ray expected ${EXPECTED_STUDENT_GPUS} visible GPUs, got ${NUM_GPUS}: ${STUDENT_CUDA_VISIBLE_DEVICES}" >&2
+    echo "[ERROR] Set EXPECTED_STUDENT_GPUS=0 to bypass this check for debugging." >&2
+    exit 1
+  fi
+fi
+if [[ "${CUDA_VISIBLE_DEVICES}" != "${STUDENT_CUDA_VISIBLE_DEVICES}" ]]; then
+  echo "[ERROR] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} must match STUDENT_CUDA_VISIBLE_DEVICES=${STUDENT_CUDA_VISIBLE_DEVICES}" >&2
+  exit 1
+fi
 require_positive_int "TENSOR_MODEL_PARALLEL_SIZE" "${TENSOR_MODEL_PARALLEL_SIZE}"
 require_positive_int "PIPELINE_MODEL_PARALLEL_SIZE" "${PIPELINE_MODEL_PARALLEL_SIZE}"
 require_positive_int "CONTEXT_PARALLEL_SIZE" "${CONTEXT_PARALLEL_SIZE}"
@@ -986,9 +1026,11 @@ if [[ "${ENABLE_SLIME_EVAL}" == "true" ]]; then
   )
 fi
 
+RAY_JOB_CMD=(env "CUDA_VISIBLE_DEVICES=${STUDENT_CUDA_VISIBLE_DEVICES}" "${CMD[@]}")
+
 write_argv_artifact() {
   {
-    printf "%q " "${CMD[@]}"
+    printf "%q " "${RAY_JOB_CMD[@]}"
     printf "\n"
   } >"${ARTIFACT_DIR}/argv.sh"
 }
@@ -1026,7 +1068,15 @@ PROMPT_MAX_LENGTH=${PROMPT_MAX_LENGTH}
 COMPLETION_MAX_LENGTH=${COMPLETION_MAX_LENGTH}
 G1_FILTER_TRAIN_DATA=${G1_FILTER_TRAIN_DATA}
 G1_MAX_PROMPT_LABEL_LEN=${G1_MAX_PROMPT_LABEL_LEN}
+TEACHER_CUDA_VISIBLE_DEVICES=${TEACHER_CUDA_VISIBLE_DEVICES}
+TEACHER_NUM_GPUS=${TEACHER_NUM_GPUS}
+EXPECTED_TEACHER_GPUS=${EXPECTED_TEACHER_GPUS}
+STUDENT_CUDA_VISIBLE_DEVICES=${STUDENT_CUDA_VISIBLE_DEVICES}
+STUDENT_NUM_GPUS=${STUDENT_NUM_GPUS}
+EXPECTED_STUDENT_GPUS=${EXPECTED_STUDENT_GPUS}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 NUM_GPUS=${NUM_GPUS}
+RAY_NUM_GPUS=${RAY_NUM_GPUS}
 DP_SIZE=${DP_SIZE}
 PARALLEL_GROUP_SIZE=${PARALLEL_GROUP_SIZE}
 ENABLE_ASYNC_TRAIN=${ENABLE_ASYNC_TRAIN}
@@ -1163,12 +1213,21 @@ echo "[main-test] teacher=${TEACHER_API_BASE} style=${TEACHER_API_STYLE} model=$
 echo "[main-test] cf_target=${CF_TARGET_MODE} opd_credit=${OPD_CREDIT_ASSIGNMENT} opd_cf_norm=${OPD_CF_SCORE_NORMALIZATION} opd_cf_temp=${OPD_CF_SCORE_TEMPERATURE} opd_kl=${OPD_KL_COEF} opd_kl_application=${OPD_KL_APPLICATION}"
 echo "[main-test] teacher_completion lambda=${CF_TEACHER_LAMBDA} teacher_samples=${CF_TEACHER_N_SAMPLES} teacher_cache=${TEACHER_CACHE_ENABLE}"
 echo "[main-test] ebft_loss=${G1_USE_EBFT_LOSS} ce_loss_coef=${G1_CE_LOSS_COEF}"
-echo "[preflight] NUM_GPUS=${NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} CRITIC_NUM_NODES=${CRITIC_NUM_NODES} CRITIC_NUM_GPUS_PER_NODE=${CRITIC_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
+echo "[layout] teacher CUDA_VISIBLE_DEVICES=${TEACHER_CUDA_VISIBLE_DEVICES} NUM_GPUS=${TEACHER_NUM_GPUS} EXPECTED_TEACHER_GPUS=${EXPECTED_TEACHER_GPUS}"
+echo "[layout] student/Ray CUDA_VISIBLE_DEVICES=${STUDENT_CUDA_VISIBLE_DEVICES} NUM_GPUS=${NUM_GPUS} EXPECTED_STUDENT_GPUS=${EXPECTED_STUDENT_GPUS}"
+echo "[layout] Ray/NUM_GPUS=${RAY_NUM_GPUS}"
+if [[ "${COLOCATE}" == "true" ]]; then
+  echo "[layout] student resources: actor=${ACTOR_NUM_GPUS_PER_NODE}, critic=${CRITIC_NUM_GPUS_PER_NODE}, rollout=colocated, rollout_num_gpus_setting=${ROLLOUT_NUM_GPUS}, rollout_gpu_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}, visible=${NUM_GPUS}"
+else
+  echo "[layout] student resources: actor=${ACTOR_NUM_GPUS_PER_NODE}, critic=${CRITIC_NUM_GPUS_PER_NODE}, rollout=${ROLLOUT_NUM_GPUS}, rollout_gpu_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}, visible=${NUM_GPUS}"
+fi
+echo "[preflight] RAY_NUM_GPUS=${RAY_NUM_GPUS} NUM_GPUS=${NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} CRITIC_NUM_NODES=${CRITIC_NUM_NODES} CRITIC_NUM_GPUS_PER_NODE=${CRITIC_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
 echo "[preflight] TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} ACTOR_DP=${DP_SIZE}"
 echo "[preflight] SGLANG_ATTENTION_BACKEND=${SGLANG_ATTENTION_BACKEND} SGLANG_DISABLE_OVERLAP_SCHEDULE=${SGLANG_DISABLE_OVERLAP_SCHEDULE} SGLANG_GRAMMAR_BACKEND=${SGLANG_GRAMMAR_BACKEND}"
 echo "[preflight] G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING} G1_EBFT_ROLLOUT_SAMPLING_MODE=${G1_EBFT_ROLLOUT_SAMPLING_MODE} G1_EBFT_ROLLOUT_MASK_MODE=${G1_EBFT_ROLLOUT_MASK_MODE}"
+echo "[submit] student CUDA_VISIBLE_DEVICES=${STUDENT_CUDA_VISIBLE_DEVICES}"
 echo "[submit] command:"
-printf "%q " "${CMD[@]}"
+printf "%q " "${RAY_JOB_CMD[@]}"
 echo
 echo "[artifact] ${ARTIFACT_DIR}"
 
@@ -1299,10 +1358,10 @@ fi
 "${RAY_BIN}" stop --force 2>/dev/null || true
 sleep 3
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+CUDA_VISIBLE_DEVICES="${STUDENT_CUDA_VISIBLE_DEVICES}" \
 "${RAY_BIN}" start --head \
   --node-ip-address "${RAY_NODE_IP_ADDRESS}" \
-  --num-gpus "${NUM_GPUS}" \
+  --num-gpus "${RAY_NUM_GPUS}" \
   --disable-usage-stats \
   --dashboard-host=0.0.0.0 \
   --dashboard-port="${RAY_DASHBOARD_PORT}" \
@@ -1326,11 +1385,11 @@ PY
 )"
 
 set +e
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+CUDA_VISIBLE_DEVICES="${STUDENT_CUDA_VISIBLE_DEVICES}" \
 "${RAY_BIN}" job submit \
   --address="${RAY_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- "${CMD[@]}" \
+  -- "${RAY_JOB_CMD[@]}" \
   2>&1 | tee "${DRIVER_LOG}"
 SUBMIT_STATUS=${PIPESTATUS[0]}
 set -e

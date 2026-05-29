@@ -20,10 +20,15 @@ if [[ -n "${SLIME_ROOT:-}" && "${SLIME_ROOT}" != "${LAUNCHER_SLIME_ROOT}" ]]; th
 fi
 SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SLIME_ROOT}/../.." && pwd)}"
-MEGATRON_PATH="${MEGATRON_PATH:-/root/slime_runtime/Megatron-LM}"
-SLIME_ENV_FILE="${SLIME_ENV_FILE:-/root/slime_runtime/slime_env.sh}"
-PYTHON_BIN="${PYTHON_BIN:-/root/venvs/slime/bin/python}"
+BASE_DIR="${BASE_DIR:-/root/slime_runtime}"
+VENV_DIR="${VENV_DIR:-/root/venvs/slime}"
+MEGATRON_PATH="${MEGATRON_PATH:-${BASE_DIR}/Megatron-LM}"
+SLIME_ENV_FILE="${SLIME_ENV_FILE:-${BASE_DIR}/slime_env.sh}"
+PYTHON_BIN="${PYTHON_BIN:-${VENV_DIR}/bin/python}"
 RAY_BIN="${RAY_BIN:-$(dirname "${PYTHON_BIN}")/ray}"
+BUILD_SCRIPT="${BUILD_SCRIPT:-${SLIME_ROOT}/build_conda.sh}"
+BUILD_SLIME_ENV="${BUILD_SLIME_ENV:-auto}"
+SKIP_ENV_BOOTSTRAP="${SKIP_ENV_BOOTSTRAP:-0}"
 
 # ---------------------------------------------------------------------------
 # 1. Model and dataset
@@ -70,6 +75,7 @@ USER_SET_SGLANG_DISABLE_OVERLAP_SCHEDULE="${SGLANG_DISABLE_OVERLAP_SCHEDULE+x}"
 USER_SET_SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS+x}"
 USER_SET_SGLANG_ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND+x}"
 USER_SET_SGLANG_SAMPLING_BACKEND="${SGLANG_SAMPLING_BACKEND+x}"
+USER_SET_SGLANG_GRAMMAR_BACKEND="${SGLANG_GRAMMAR_BACKEND+x}"
 USER_SET_SGLANG_DIRECT_WORKER_MODE="${SGLANG_DIRECT_WORKER_MODE+x}"
 USER_SET_SLIME_SGLANG_HEALTH_TIMEOUT="${SLIME_SGLANG_HEALTH_TIMEOUT+x}"
 USER_SET_SLIME_SGLANG_HEALTH_MAX_WAIT="${SLIME_SGLANG_HEALTH_MAX_WAIT+x}"
@@ -154,11 +160,29 @@ G1_HIDDEN_STATE_METHOD="${G1_HIDDEN_STATE_METHOD:-last_only}"
 G1_EMBEDDING_SOURCE="${G1_EMBEDDING_SOURCE:-megatron_ref}"
 G1_REWARD_LOCATION="${G1_REWARD_LOCATION:-trainer}"
 G1_REF_FORWARD_MODE="${G1_REF_FORWARD_MODE:-openrlhf_exact}"
-# Leave unset for the launcher default. Strict EBFT block-source runs set this
-# to strict_block_source through the wrapper script below.
+G1_EBFT_PROFILE="${G1_EBFT_PROFILE:-standard}"
+case "${G1_EBFT_PROFILE}" in
+  default|standard) G1_EBFT_PROFILE="standard" ;;
+  strict_block_source) ;;
+  *) echo "[ERROR] G1_EBFT_PROFILE must be default, standard, or strict_block_source, got: ${G1_EBFT_PROFILE}" >&2; exit 1 ;;
+esac
+USER_SET_G1_EBFT_LOGPROB_INDEXING="${G1_EBFT_LOGPROB_INDEXING+x}"
+USER_SET_G1_EBFT_ROLLOUT_SAMPLING_MODE="${G1_EBFT_ROLLOUT_SAMPLING_MODE+x}"
+USER_SET_G1_EBFT_ROLLOUT_MASK_MODE="${G1_EBFT_ROLLOUT_MASK_MODE+x}"
+# Leave logprob indexing unset in the standard profile so the Slime parser
+# supplies its standard_next_token default. The strict profile below enables
+# true rollout-time block_source transport by default.
 G1_EBFT_LOGPROB_INDEXING="${G1_EBFT_LOGPROB_INDEXING:-}"
 G1_EBFT_ROLLOUT_SAMPLING_MODE="${G1_EBFT_ROLLOUT_SAMPLING_MODE:-standard}"
 G1_EBFT_ROLLOUT_MASK_MODE="${G1_EBFT_ROLLOUT_MASK_MODE:-none}"
+if [[ "${G1_EBFT_PROFILE}" == "strict_block_source" ]]; then
+  [[ -z "${USER_SET_G1_EBFT_LOGPROB_INDEXING}" ]] && G1_EBFT_LOGPROB_INDEXING="strict_block_source"
+  [[ -z "${USER_SET_G1_EBFT_ROLLOUT_SAMPLING_MODE}" ]] && G1_EBFT_ROLLOUT_SAMPLING_MODE="block_source"
+  [[ -z "${USER_SET_G1_EBFT_ROLLOUT_MASK_MODE}" ]] && G1_EBFT_ROLLOUT_MASK_MODE="sparse_ir"
+  [[ -z "${USER_SET_SGLANG_ATTENTION_BACKEND}" ]] && SGLANG_ATTENTION_BACKEND="triton"
+  [[ -z "${USER_SET_SGLANG_DISABLE_OVERLAP_SCHEDULE}" ]] && SGLANG_DISABLE_OVERLAP_SCHEDULE="true"
+  [[ -z "${USER_SET_SGLANG_GRAMMAR_BACKEND}" ]] && SGLANG_GRAMMAR_BACKEND="none"
+fi
 USE_WHITENING="${USE_WHITENING:-true}"
 ALIGNMENT_REW_COEF="${ALIGNMENT_REW_COEF:-1.0}"
 DIVERSITY_REW_COEF="${DIVERSITY_REW_COEF:-1.0}"
@@ -195,14 +219,58 @@ RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_g1_main}"
 DRIVER_LOG="${ARTIFACT_DIR}/ray_job_driver.log"
 
-if [[ -f "${SLIME_ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${SLIME_ENV_FILE}"
-fi
-if [[ "${SLIME_ROOT:-}" != "${LAUNCHER_SLIME_ROOT}" ]]; then
-  echo "[root-guard] ${SLIME_ENV_FILE} set SLIME_ROOT=${SLIME_ROOT:-<unset>}; restoring launcher root ${LAUNCHER_SLIME_ROOT}" >&2
-  SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
-fi
+need_slime_env_build() {
+  case "${BUILD_SLIME_ENV}" in
+    true|1) return 0 ;;
+    false|0) return 1 ;;
+    auto) ;;
+    *) echo "[ERROR] BUILD_SLIME_ENV must be auto, true, or false, got: ${BUILD_SLIME_ENV}" >&2; exit 1 ;;
+  esac
+  [[ ! -x "${PYTHON_BIN}" && ! -x "${VENV_DIR}/bin/python" ]] && return 0
+  [[ ! -f "${SLIME_ENV_FILE}" ]] && return 0
+  [[ ! -d "${BASE_DIR}/sglang/python/sglang" ]] && return 0
+  return 1
+}
+
+maybe_bootstrap_slime_env() {
+  if [[ "${PRINT_ONLY:-0}" == "1" || "${DRY_RUN_ONLY:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${SKIP_ENV_BOOTSTRAP}" == "1" ]]; then
+    return 0
+  fi
+  if ! need_slime_env_build; then
+    return 0
+  fi
+  if [[ ! -f "${BUILD_SCRIPT}" ]]; then
+    echo "[ERROR] BUILD_SLIME_ENV requested but BUILD_SCRIPT missing: ${BUILD_SCRIPT}" >&2
+    exit 1
+  fi
+  echo "[bootstrap] building Slime env via ${BUILD_SCRIPT}"
+  bash "${BUILD_SCRIPT}"
+}
+
+source_slime_env() {
+  if [[ -f "${SLIME_ENV_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${SLIME_ENV_FILE}"
+  fi
+  if [[ "${SLIME_ROOT:-}" != "${LAUNCHER_SLIME_ROOT}" ]]; then
+    echo "[root-guard] ${SLIME_ENV_FILE} set SLIME_ROOT=${SLIME_ROOT:-<unset>}; restoring launcher root ${LAUNCHER_SLIME_ROOT}" >&2
+    SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" && -d "${VIRTUAL_ENV}/bin" ]]; then
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+  elif [[ -d "$(dirname "${PYTHON_BIN}")" ]]; then
+    export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+  fi
+  if [[ ! -x "${RAY_BIN}" && -x "$(dirname "${PYTHON_BIN}")/ray" ]]; then
+    RAY_BIN="$(dirname "${PYTHON_BIN}")/ray"
+  fi
+}
+
+maybe_bootstrap_slime_env
+source_slime_env
 
 if [[ -n "${EXTRA_PYTHONPATH:-}" ]]; then
   export PYTHONPATH="${MEGATRON_PATH}:${SLIME_ROOT}:${EXTRA_PYTHONPATH}"
@@ -751,6 +819,7 @@ G1_HIDDEN_STATE_METHOD=${G1_HIDDEN_STATE_METHOD}
 G1_EMBEDDING_SOURCE=${G1_EMBEDDING_SOURCE}
 G1_REWARD_LOCATION=${G1_REWARD_LOCATION}
 G1_REF_FORWARD_MODE=${G1_REF_FORWARD_MODE}
+G1_EBFT_PROFILE=${G1_EBFT_PROFILE}
 G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING}
 G1_EBFT_ROLLOUT_SAMPLING_MODE=${G1_EBFT_ROLLOUT_SAMPLING_MODE}
 G1_EBFT_ROLLOUT_MASK_MODE=${G1_EBFT_ROLLOUT_MASK_MODE}
@@ -789,6 +858,7 @@ echo "[preflight] TRAIN_ENTRY=${SLIME_ROOT}/${TRAIN_ENTRYPOINT}"
 echo "[preflight] SGLANG_STABLE_ROLLOUT_MODE=${SGLANG_STABLE_ROLLOUT_MODE} ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE} SGLANG_DIRECT_WORKER_MODE=${SGLANG_DIRECT_WORKER_MODE}"
 echo "[preflight] SGLANG_ATTENTION_BACKEND=${SGLANG_ATTENTION_BACKEND:-launcher-default} SGLANG_DISABLE_OVERLAP_SCHEDULE=${SGLANG_DISABLE_OVERLAP_SCHEDULE}"
 echo "[preflight] TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} ACTOR_DP=${DP_SIZE}"
+echo "[preflight] G1_EBFT_PROFILE=${G1_EBFT_PROFILE}"
 echo "[preflight] G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING:-launcher-default}"
 echo "[preflight] G1_EBFT_ROLLOUT_SAMPLING_MODE=${G1_EBFT_ROLLOUT_SAMPLING_MODE} G1_EBFT_ROLLOUT_MASK_MODE=${G1_EBFT_ROLLOUT_MASK_MODE} SGLANG_GRAMMAR_BACKEND=${SGLANG_GRAMMAR_BACKEND:-launcher-default}"
 echo "[submit] command:"

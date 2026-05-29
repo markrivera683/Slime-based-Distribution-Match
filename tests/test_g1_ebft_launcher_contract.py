@@ -73,7 +73,17 @@ def launcher_env(tmp_path: Path) -> dict[str, str]:
             "TENSOR_MODEL_PARALLEL_SIZE": "1",
         }
     )
-    env.pop("G1_EBFT_LOGPROB_INDEXING", None)
+    for key in (
+        "BUILD_SLIME_ENV",
+        "G1_EBFT_LOGPROB_INDEXING",
+        "G1_EBFT_PROFILE",
+        "G1_EBFT_ROLLOUT_MASK_MODE",
+        "G1_EBFT_ROLLOUT_SAMPLING_MODE",
+        "SGLANG_ATTENTION_BACKEND",
+        "SGLANG_DISABLE_OVERLAP_SCHEDULE",
+        "SGLANG_GRAMMAR_BACKEND",
+    ):
+        env.pop(key, None)
     return env
 
 
@@ -105,6 +115,29 @@ def _run_launcher_failure(script: Path, env: dict[str, str]) -> str:
     return proc.stdout + proc.stderr
 
 
+def _run_context(env: dict[str, str]) -> str:
+    return (Path(env["ARTIFACT_DIR"]) / "run_context.env").read_text(encoding="utf-8")
+
+
+def _assert_strict_blockwise_profile(output: str) -> None:
+    assert "--g1-ebft-logprob-indexing strict_block_source" in output
+    assert "--g1-ebft-rollout-sampling-mode block_source" in output
+    assert "--g1-ebft-rollout-mask-mode sparse_ir" in output
+    assert "--sglang-attention-backend triton" in output
+    assert "--sglang-disable-overlap-schedule" in output
+    assert "--sglang-grammar-backend none" in output
+    assert "[preflight] G1_EBFT_PROFILE=strict_block_source" in output
+    assert "[preflight] G1_EBFT_LOGPROB_INDEXING=strict_block_source" in output
+    assert (
+        "[preflight] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source "
+        "G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir SGLANG_GRAMMAR_BACKEND=none"
+    ) in output
+    assert (
+        "[preflight] SGLANG_ATTENTION_BACKEND=triton "
+        "SGLANG_DISABLE_OVERLAP_SCHEDULE=true"
+    ) in output
+
+
 def test_main_launcher_print_only_uses_launcher_default_logprob_indexing(launcher_env: dict[str, str]) -> None:
     output = _run_launcher(MAIN_LAUNCHER, launcher_env)
 
@@ -113,49 +146,61 @@ def test_main_launcher_print_only_uses_launcher_default_logprob_indexing(launche
     assert "--g1-ebft-rollout-mask-mode" not in output
     assert "--sglang-disable-overlap-schedule" not in output
     assert "--sglang-grammar-backend" not in output
+    assert "[preflight] G1_EBFT_PROFILE=standard" in output
     assert "[preflight] G1_EBFT_LOGPROB_INDEXING=launcher-default" in output
     assert (
         "[preflight] G1_EBFT_ROLLOUT_SAMPLING_MODE=standard "
         "G1_EBFT_ROLLOUT_MASK_MODE=none SGLANG_GRAMMAR_BACKEND=launcher-default"
     ) in output
+    assert "G1_EBFT_PROFILE=standard" in _run_context(launcher_env)
 
 
-def test_strict_wrapper_print_only_adds_strict_block_source_indexing(launcher_env: dict[str, str]) -> None:
+def test_strict_wrapper_print_only_adds_strict_block_source_blockwise_profile(
+    launcher_env: dict[str, str],
+) -> None:
     output = _run_launcher(STRICT_LAUNCHER, launcher_env)
 
-    assert "--g1-ebft-logprob-indexing strict_block_source" in output
-    assert "--g1-ebft-rollout-sampling-mode" not in output
-    assert "--g1-ebft-rollout-mask-mode" not in output
-    assert "--sglang-grammar-backend none" in output
-    assert "[preflight] G1_EBFT_LOGPROB_INDEXING=strict_block_source" in output
-    assert (
-        "[preflight] G1_EBFT_ROLLOUT_SAMPLING_MODE=standard "
-        "G1_EBFT_ROLLOUT_MASK_MODE=none SGLANG_GRAMMAR_BACKEND=none"
-    ) in output
+    _assert_strict_blockwise_profile(output)
+    context = _run_context(launcher_env)
+    assert "G1_EBFT_PROFILE=strict_block_source" in context
+    assert "G1_EBFT_LOGPROB_INDEXING=strict_block_source" in context
+    assert "G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source" in context
+    assert "G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir" in context
+
+
+def test_main_launcher_print_only_strict_profile_matches_wrapper_blockwise_flags(
+    launcher_env: dict[str, str],
+) -> None:
+    env = launcher_env.copy()
+    env["G1_EBFT_PROFILE"] = "strict_block_source"
+
+    output = _run_launcher(MAIN_LAUNCHER, env)
+
+    _assert_strict_blockwise_profile(output)
 
 
 def test_strict_wrapper_print_only_rejects_sparse_rollout_mask_without_block_source_sampling(
     launcher_env: dict[str, str],
 ) -> None:
     env = launcher_env.copy()
+    env["G1_EBFT_ROLLOUT_SAMPLING_MODE"] = "standard"
     env["G1_EBFT_ROLLOUT_MASK_MODE"] = "sparse_ir"
     env["SGLANG_ATTENTION_BACKEND"] = "triton"
-    env["SGLANG_GRAMMAR_BACKEND"] = "xgrammar"
 
     output = _run_launcher_failure(STRICT_LAUNCHER, env)
 
     assert "transport only" in output
 
 
-def test_strict_wrapper_print_only_rejects_block_source_sampling_without_dense4d(
+def test_strict_wrapper_print_only_rejects_block_source_sampling_without_rollout_mask(
     launcher_env: dict[str, str],
 ) -> None:
     env = launcher_env.copy()
-    env["G1_EBFT_ROLLOUT_SAMPLING_MODE"] = "block_source"
+    env["G1_EBFT_ROLLOUT_MASK_MODE"] = "none"
 
     output = _run_launcher_failure(STRICT_LAUNCHER, env)
 
-    assert "requires G1_EBFT_ROLLOUT_MASK_MODE=dense4d" in output
+    assert "requires G1_EBFT_ROLLOUT_MASK_MODE=dense4d or sparse_ir" in output
 
 
 def test_main_launcher_print_only_adds_experimental_block_source_flags(
@@ -184,6 +229,25 @@ def test_main_launcher_print_only_adds_experimental_block_source_flags(
         "[preflight] SGLANG_ATTENTION_BACKEND=torch_native "
         "SGLANG_DISABLE_OVERLAP_SCHEDULE=true"
     ) in output
+
+
+def test_main_launcher_print_only_with_fake_build_script_does_not_bootstrap(
+    launcher_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "build-ran"
+    fake_build = tmp_path / "fake_build.sh"
+    fake_build.write_text("#!/usr/bin/env bash\n: >\"${BUILD_MARKER}\"\nexit 42\n", encoding="utf-8")
+
+    env = launcher_env.copy()
+    env["BUILD_MARKER"] = str(marker)
+    env["BUILD_SCRIPT"] = str(fake_build)
+    env["BUILD_SLIME_ENV"] = "true"
+
+    output = _run_launcher(MAIN_LAUNCHER, env)
+
+    assert "[preflight] G1_EBFT_PROFILE=standard" in output
+    assert not marker.exists()
 
 
 def test_launcher_ignores_inherited_old_slime_root_for_train_entry(launcher_env: dict[str, str]) -> None:
