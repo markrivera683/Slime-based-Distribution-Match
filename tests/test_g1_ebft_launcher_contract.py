@@ -11,7 +11,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # negative TRAIN_ENTRY assertion exercises the inherited-root guard.
 OLD_SLIME_ROOT = REPO_ROOT.with_name(f"{REPO_ROOT.name}_old")
 MAIN_LAUNCHER = REPO_ROOT / "exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_main.sh"
-STRICT_LAUNCHER = REPO_ROOT / "exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh"
 
 
 @pytest.fixture()
@@ -119,6 +118,12 @@ def _run_context(env: dict[str, str]) -> str:
     return (Path(env["ARTIFACT_DIR"]) / "run_context.env").read_text(encoding="utf-8")
 
 
+def _strict_profile_env(env: dict[str, str]) -> dict[str, str]:
+    strict_env = env.copy()
+    strict_env["G1_EBFT_PROFILE"] = "strict_block_source"
+    return strict_env
+
+
 def _assert_strict_blockwise_profile(output: str) -> None:
     assert "--g1-ebft-logprob-indexing strict_block_source" in output
     assert "--g1-ebft-rollout-sampling-mode block_source" in output
@@ -155,50 +160,51 @@ def test_main_launcher_print_only_uses_launcher_default_logprob_indexing(launche
     assert "G1_EBFT_PROFILE=standard" in _run_context(launcher_env)
 
 
-def test_strict_wrapper_print_only_adds_strict_block_source_blockwise_profile(
+def test_strict_profile_print_only_adds_strict_block_source_blockwise_profile(
     launcher_env: dict[str, str],
 ) -> None:
-    output = _run_launcher(STRICT_LAUNCHER, launcher_env)
+    env = _strict_profile_env(launcher_env)
+
+    output = _run_launcher(MAIN_LAUNCHER, env)
 
     _assert_strict_blockwise_profile(output)
-    context = _run_context(launcher_env)
+    context = _run_context(env)
     assert "G1_EBFT_PROFILE=strict_block_source" in context
     assert "G1_EBFT_LOGPROB_INDEXING=strict_block_source" in context
     assert "G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source" in context
     assert "G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir" in context
 
 
-def test_main_launcher_print_only_strict_profile_matches_wrapper_blockwise_flags(
+def test_main_launcher_print_only_strict_profile_sets_blockwise_flags(
     launcher_env: dict[str, str],
 ) -> None:
-    env = launcher_env.copy()
-    env["G1_EBFT_PROFILE"] = "strict_block_source"
+    env = _strict_profile_env(launcher_env)
 
     output = _run_launcher(MAIN_LAUNCHER, env)
 
     _assert_strict_blockwise_profile(output)
 
 
-def test_strict_wrapper_print_only_rejects_sparse_rollout_mask_without_block_source_sampling(
+def test_strict_profile_print_only_rejects_sparse_rollout_mask_without_block_source_sampling(
     launcher_env: dict[str, str],
 ) -> None:
-    env = launcher_env.copy()
+    env = _strict_profile_env(launcher_env)
     env["G1_EBFT_ROLLOUT_SAMPLING_MODE"] = "standard"
     env["G1_EBFT_ROLLOUT_MASK_MODE"] = "sparse_ir"
     env["SGLANG_ATTENTION_BACKEND"] = "triton"
 
-    output = _run_launcher_failure(STRICT_LAUNCHER, env)
+    output = _run_launcher_failure(MAIN_LAUNCHER, env)
 
     assert "transport only" in output
 
 
-def test_strict_wrapper_print_only_rejects_block_source_sampling_without_rollout_mask(
+def test_strict_profile_print_only_rejects_block_source_sampling_without_rollout_mask(
     launcher_env: dict[str, str],
 ) -> None:
-    env = launcher_env.copy()
+    env = _strict_profile_env(launcher_env)
     env["G1_EBFT_ROLLOUT_MASK_MODE"] = "none"
 
-    output = _run_launcher_failure(STRICT_LAUNCHER, env)
+    output = _run_launcher_failure(MAIN_LAUNCHER, env)
 
     assert "requires G1_EBFT_ROLLOUT_MASK_MODE=dense4d or sparse_ir" in output
 
