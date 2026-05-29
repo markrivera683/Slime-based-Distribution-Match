@@ -8,6 +8,10 @@ import pytest
 
 
 def _install_arguments_import_stubs(monkeypatch):
+    yaml = types.ModuleType("yaml")
+    yaml.safe_load = lambda *args, **kwargs: {}
+    monkeypatch.setitem(sys.modules, "yaml", yaml)
+
     sglang_router = types.ModuleType("sglang_router")
     launch_router = types.ModuleType("sglang_router.launch_router")
 
@@ -68,6 +72,8 @@ def _base_slime_args(**overrides):
         freeze_params_name_list=None,
         g1_context_length=8,
         g1_ebft_logprob_indexing="strict_block_source",
+        g1_ebft_rollout_mask_mode="none",
+        g1_ebft_rollout_sampling_mode="standard",
         g1_embedding_source="rollout",
         g1_generate_length=8,
         g1_prompt_length=24,
@@ -113,6 +119,8 @@ def _base_slime_args(**overrides):
         rollout_num_gpus=1,
         save=None,
         save_interval=None,
+        sglang_attention_backend=None,
+        sglang_disable_overlap_schedule=False,
         train_backend="megatron",
         train_memory_margin_bytes=0,
         use_dynamic_batch_size=False,
@@ -147,6 +155,40 @@ def test_g1_ebft_logprob_indexing_parser_default_and_choices(monkeypatch):
         parser.parse_args([*required_args, "--g1-ebft-logprob-indexing", "bad_indexing"])
 
 
+def test_g1_ebft_rollout_mask_mode_parser_default_and_choices(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    arguments.get_slime_extra_args_provider()(parser)
+
+    required_args = ["--rollout-batch-size", "1"]
+
+    assert parser.parse_args(required_args).g1_ebft_rollout_mask_mode == "none"
+    assert parser.parse_args([*required_args, "--g1-ebft-rollout-mask-mode", "dense4d"]).g1_ebft_rollout_mask_mode == "dense4d"
+    assert parser.parse_args([*required_args, "--g1-ebft-rollout-mask-mode", "sparse_ir"]).g1_ebft_rollout_mask_mode == "sparse_ir"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([*required_args, "--g1-ebft-rollout-mask-mode", "bad_mode"])
+
+
+def test_g1_ebft_rollout_sampling_mode_parser_default_and_choices(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    arguments.get_slime_extra_args_provider()(parser)
+
+    required_args = ["--rollout-batch-size", "1"]
+
+    assert parser.parse_args(required_args).g1_ebft_rollout_sampling_mode == "standard"
+    assert (
+        parser.parse_args(
+            [*required_args, "--g1-ebft-rollout-sampling-mode", "block_source"]
+        ).g1_ebft_rollout_sampling_mode
+        == "block_source"
+    )
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([*required_args, "--g1-ebft-rollout-sampling-mode", "bad_mode"])
+
+
 def test_slime_validate_args_accepts_strict_block_source_geometry(monkeypatch):
     arguments = _arguments_module(monkeypatch)
     args = _base_slime_args()
@@ -175,6 +217,147 @@ def test_slime_validate_args_rejects_strict_block_source_response_length_mismatc
 def test_slime_validate_args_rejects_strict_block_source_without_ebft_loss(monkeypatch):
     arguments = _arguments_module(monkeypatch)
     args = _base_slime_args(g1_use_ebft_loss=False)
+
+    with pytest.raises(ValueError, match="requires --g1-use-ebft-loss"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_accepts_dense_block_source_rollout_sampling(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_context_length=8,
+        g1_ebft_rollout_mask_mode="dense4d",
+        g1_ebft_rollout_sampling_mode="block_source",
+        g1_generate_length=1,
+        g1_prompt_length=10,
+        g1_response_length=2,
+        g1_stride=1,
+        sglang_attention_backend="torch_native",
+        sglang_disable_overlap_schedule=True,
+    )
+
+    arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_accepts_block_source_rollout_sampling_generate_length_gt_one(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_ebft_rollout_mask_mode="dense4d",
+        g1_ebft_rollout_sampling_mode="block_source",
+        sglang_attention_backend="torch_native",
+        sglang_disable_overlap_schedule=True,
+    )
+
+    arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_accepts_sparse_block_source_rollout_sampling(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_context_length=8,
+        g1_ebft_rollout_mask_mode="sparse_ir",
+        g1_ebft_rollout_sampling_mode="block_source",
+        g1_generate_length=1,
+        g1_prompt_length=10,
+        g1_response_length=2,
+        g1_stride=1,
+        sglang_attention_backend="triton",
+        sglang_disable_overlap_schedule=True,
+    )
+
+    arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_block_source_rollout_sampling_without_mask(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_context_length=8,
+        g1_ebft_rollout_sampling_mode="block_source",
+        g1_generate_length=1,
+        g1_prompt_length=10,
+        g1_response_length=2,
+        g1_stride=1,
+        sglang_attention_backend="torch_native",
+        sglang_disable_overlap_schedule=True,
+    )
+
+    with pytest.raises(ValueError, match="requires --g1-ebft-rollout-mask-mode dense4d or sparse_ir"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_block_source_rollout_sampling_without_torch_native(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_context_length=8,
+        g1_ebft_rollout_mask_mode="dense4d",
+        g1_ebft_rollout_sampling_mode="block_source",
+        g1_generate_length=1,
+        g1_prompt_length=10,
+        g1_response_length=2,
+        g1_stride=1,
+        sglang_attention_backend="triton",
+        sglang_disable_overlap_schedule=True,
+    )
+
+    with pytest.raises(ValueError, match="dense4d requires --sglang-attention-backend torch_native"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_sparse_block_source_rollout_sampling_without_triton(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_context_length=8,
+        g1_ebft_rollout_mask_mode="sparse_ir",
+        g1_ebft_rollout_sampling_mode="block_source",
+        g1_generate_length=1,
+        g1_prompt_length=10,
+        g1_response_length=2,
+        g1_stride=1,
+        sglang_attention_backend="torch_native",
+        sglang_disable_overlap_schedule=True,
+    )
+
+    with pytest.raises(ValueError, match="sparse_ir requires --sglang-attention-backend triton"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_block_source_rollout_sampling_with_overlap_schedule(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        g1_context_length=8,
+        g1_ebft_rollout_mask_mode="dense4d",
+        g1_ebft_rollout_sampling_mode="block_source",
+        g1_generate_length=1,
+        g1_prompt_length=10,
+        g1_response_length=2,
+        g1_stride=1,
+        sglang_attention_backend="torch_native",
+        sglang_disable_overlap_schedule=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --sglang-disable-overlap-schedule"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_mask_transport_in_standard_rollout_sampling(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(g1_ebft_rollout_mask_mode="dense4d")
+
+    with pytest.raises(ValueError, match="transport only"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_rollout_mask_mode_without_strict_indexing(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(g1_ebft_logprob_indexing="standard_next_token", g1_ebft_rollout_mask_mode="dense4d")
+
+    with pytest.raises(ValueError, match="transport only"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_rollout_mask_mode_without_ebft_loss(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(g1_use_ebft_loss=False, g1_ebft_rollout_mask_mode="sparse_ir")
 
     with pytest.raises(ValueError, match="requires --g1-use-ebft-loss"):
         arguments.slime_validate_args(args)

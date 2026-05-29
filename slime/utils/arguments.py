@@ -1507,6 +1507,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--g1-ebft-rollout-sampling-mode",
+                type=str,
+                choices=["standard", "block_source"],
+                default="standard",
+                help=(
+                    "Rollout sampling semantics for G1 EBFT. 'standard' uses ordinary SGLang generation. "
+                    "'block_source' experimentally supports strict dense4d+torch_native or "
+                    "sparse_ir+triton rollout with any valid --g1-generate-length > 0 and "
+                    "overlap schedule disabled."
+                ),
+            )
+            parser.add_argument(
+                "--g1-ebft-rollout-mask-mode",
+                type=str,
+                choices=["none", "dense4d", "sparse_ir"],
+                default="none",
+                help=(
+                    "Attach G1 EBFT rollout mask transport data to each SGLang /generate payload. "
+                    "'dense4d' sends ebft_dense_attention_mask + ebft_position_ids; "
+                    "'sparse_ir' sends ebft_sparse_ir + ebft_position_ids. Both send ebft_mask_spec. "
+                    "block_source sampling accepts dense4d only with torch_native attention and sparse_ir "
+                    "only with Triton attention."
+                ),
+            )
+            parser.add_argument(
                 "--g1-megatron-ref-forward-mode",
                 type=str,
                 choices=["standard", "openrlhf_exact"],
@@ -2121,6 +2146,53 @@ def slime_validate_args(args):
                 )
     elif getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "standard_next_token":
         raise ValueError("--g1-ebft-logprob-indexing strict_block_source requires --g1-use-ebft-loss")
+
+    rollout_sampling_mode = getattr(args, "g1_ebft_rollout_sampling_mode", "standard")
+    rollout_mask_mode = getattr(args, "g1_ebft_rollout_mask_mode", "none")
+    if rollout_sampling_mode not in {"standard", "block_source"}:
+        raise ValueError(
+            "--g1-ebft-rollout-sampling-mode must be standard or block_source, "
+            f"got {rollout_sampling_mode!r}"
+        )
+    if rollout_mask_mode not in {"none", "dense4d", "sparse_ir"}:
+        raise ValueError(f"--g1-ebft-rollout-mask-mode must be none, dense4d, or sparse_ir, got {rollout_mask_mode!r}")
+    if rollout_mask_mode != "none" and rollout_sampling_mode == "standard":
+        raise ValueError(
+            "--g1-ebft-rollout-mask-mode is transport only and requires "
+            "--g1-ebft-rollout-sampling-mode block_source; standard sampling cannot consume EBFT rollout masks"
+        )
+    if rollout_sampling_mode == "block_source":
+        if rollout_mask_mode not in {"dense4d", "sparse_ir"}:
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--g1-ebft-rollout-mask-mode dense4d or sparse_ir"
+            )
+        if not bool(getattr(args, "g1_use_ebft_loss", False)):
+            raise ValueError("--g1-ebft-rollout-sampling-mode block_source requires --g1-use-ebft-loss")
+        if getattr(args, "g1_ebft_logprob_indexing", "standard_next_token") != "strict_block_source":
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--g1-ebft-logprob-indexing strict_block_source"
+            )
+        if hasattr(args, "sglang_attention_backend"):
+            sglang_attention_backend = getattr(args, "sglang_attention_backend")
+            if rollout_mask_mode == "dense4d" and sglang_attention_backend != "torch_native":
+                raise ValueError(
+                    "--g1-ebft-rollout-sampling-mode block_source with dense4d requires "
+                    "--sglang-attention-backend torch_native"
+                )
+            if rollout_mask_mode == "sparse_ir" and sglang_attention_backend != "triton":
+                raise ValueError(
+                    "--g1-ebft-rollout-sampling-mode block_source with sparse_ir requires "
+                    "--sglang-attention-backend triton"
+                )
+        if hasattr(args, "sglang_disable_overlap_schedule") and not bool(
+            getattr(args, "sglang_disable_overlap_schedule")
+        ):
+            raise ValueError(
+                "--g1-ebft-rollout-sampling-mode block_source requires "
+                "--sglang-disable-overlap-schedule"
+            )
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

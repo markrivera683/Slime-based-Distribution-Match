@@ -10,6 +10,17 @@ agents/users before they involve SGLang, Ray, Megatron, or GPUs.
 - CPU unit/smoke coverage: strict pair-axis helpers, argument validation, data
   contract wiring, loss gather behavior, and a tiny rollout-to-loss smoke are
   represented in tests.
+- Dense `block_source` runtime path: PASS for a single-request `dense4d` +
+  `torch_native` runtime smoke, not per-block fallback. SGLang returned HTTP
+  200, `output_ids=[148, 18, 10, 12]`, length 4, and
+  `ebft_sample_source_rows=[[1, 3], [6, 7]]`.
+- Sparse `block_source` runtime path: PASS for a single-request `sparse_ir` +
+  Triton runtime smoke, not per-block fallback. SGLang returned HTTP 200,
+  `output_ids=[144, 8, 10, 79]`, length 4, and
+  `ebft_sample_source_rows=[[1, 3], [6, 7]]`.
+- Final verification snapshot: Slime pytest `77 passed, 4 skipped`; validators
+  pass; launcher `PRINT_ONLY` dense/sparse pass; SGLang `py_compile`/diff pass;
+  dense4d torch-native and sparse_ir Triton single-request runtime smokes pass.
 - GPU/Ray parity: not established yet. The strict path is wired for the trainer
   batch/loss flow, but it still needs an end-to-end distributed run against the
   OpenRLHF/EBFT reference behavior.
@@ -195,16 +206,54 @@ The wrapper sets:
 
 ```bash
 G1_EBFT_LOGPROB_INDEXING=strict_block_source
+G1_EBFT_ROLLOUT_SAMPLING_MODE=standard
+G1_EBFT_ROLLOUT_MASK_MODE=none
+SGLANG_GRAMMAR_BACKEND=none
 ```
 
-and then delegates to the same G1 EBFT GT launcher. All existing environment
-overrides still work, for example:
+and then delegates to the same G1 EBFT GT launcher. It does not opt into rollout
+mask transport by default.
+
+Strict EBFT block-source rollout sampling is now allowed for full
+`generate_length > 1` runs under two narrow SGLang contracts:
+`G1_EBFT_ROLLOUT_MASK_MODE=dense4d` with
+`SGLANG_ATTENTION_BACKEND=torch_native`, or
+`G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir` with
+`SGLANG_ATTENTION_BACKEND=triton`. Both require
+`SGLANG_DISABLE_OVERLAP_SCHEDULE=true`. Dense and sparse mask payloads remain
+mutually exclusive, and mask transport is still rejected under standard
+sampling.
+
+All existing environment overrides still work for supported settings, for
+example:
 
 ```bash
 NUM_ROLLOUT=1 \
 SGLANG_STABLE_ROLLOUT_MODE=true \
+SGLANG_GRAMMAR_BACKEND=none \
 exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh
 ```
+
+The dense and sparse mask payload paths are verified on the Slime side for the
+restricted runtimes. A minimal command-inspection example for the sparse
+experimental shape is:
+
+```bash
+PRINT_ONLY=1 \
+NUM_ROLLOUT=1 \
+SGLANG_STABLE_ROLLOUT_MODE=true \
+G1_GENERATE_LENGTH=1 \
+G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir \
+G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source \
+SGLANG_ATTENTION_BACKEND=triton \
+SGLANG_DISABLE_OVERLAP_SCHEDULE=true \
+SGLANG_GRAMMAR_BACKEND=none \
+exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh
+```
+
+To inspect the full dense path, set `G1_GENERATE_LENGTH` to any valid positive
+G1 geometry value and keep `G1_RESPONSE_LENGTH == G1_GENERATE_LENGTH *
+num_blocks`.
 
 For non-GPU command inspection only, use:
 
@@ -219,6 +268,7 @@ The run artifacts include `G1_EBFT_LOGPROB_INDEXING` in
 
 ```bash
 --g1-ebft-logprob-indexing strict_block_source
+--sglang-grammar-backend none
 ```
 
 The launcher pins `SLIME_ROOT` to the checkout containing the script. This is
@@ -245,6 +295,69 @@ running SGLang/Ray actors or CUDA kernels:
 If Megatron is unavailable in the local environment, the strict smoke test is
 expected to skip rather than fail.
 
+## Runtime Smoke Notes
+
+The local SGLang EBFT payload smoke script is
+`refactor_debugging/blockwise/smoke_sglang_ebft_dense_mask.py`. It starts a
+short-lived SGLang HTTP server against the local dummy tiny Llama fixture and
+sends one `/generate` request carrying EBFT mask fields. This is a runtime
+payload smoke only; it is not a Ray/Megatron training run.
+
+Observed smoke state in this workspace:
+
+- Dependencies checked: the script requires the local SGLang source at
+  `/root/slime_runtime/sglang/python`, the tiny model fixture under
+  `Distributional-Match-Tuning-dev-dlc/local_smoke_llama`, and Python import
+  dependency `tqdm`. `tqdm` is importable in the active environment. Optional
+  grammar packages `xgrammar`, `outlines`, and `llguidance` are not importable
+  from this checkout environment, so `SGLANG_GRAMMAR_BACKEND=none` is the safe
+  launcher default.
+- Contract fixture: the smoke script now calls
+  `build_g1_ebft_rollout_mask_contract()` and reuses the Slime strict EBFT
+  rollout mask contract instead of a simplified `[0, 1, 2, 3]` causal fixture.
+  It generates `ebft_mask_spec`, `ebft_position_ids`, the dense additive mask,
+  `to_span_sparse_ir()`, and `rollout_source_rows` from the same contract.
+- Default tiny fixture: `prompt_len=6`, `context_len=2`, `stride=2`,
+  `generate_length=2`, `num_blocks=2`. The strict contract source rows are
+  `[1, 3, 6, 7]`, and runtime reports them as
+  `ebft_sample_source_rows=[[1, 3], [6, 7]]`.
+- Request payload hygiene: block-source smoke payloads include
+  `ignore_eos=True`, `stop=[]`, and `stop_token_ids=[]` so the fixed EBFT
+  response shape is length-driven.
+- Dense CPU real-contract smoke: PASS for `dense4d` with
+  `--attention-backend torch_native`, `--device cpu`,
+  `--grammar-backend none`, `--generate-length 2`, and `--num-blocks 2`.
+  It reached `/generate` HTTP 200 with `output_ids=[148, 18, 10, 12]`,
+  length 4, and `ebft_sample_source_rows=[[1, 3], [6, 7]]`.
+- Sparse Triton real-contract smoke: PASS for `sparse_ir` with
+  `--attention-backend triton`, `--device cuda`, `--grammar-backend none`,
+  `--generate-length 2`, and `--num-blocks 2`. It reached `/generate` HTTP
+  200 with `output_ids=[144, 8, 10, 79]`, length 4, and
+  `ebft_sample_source_rows=[[1, 3], [6, 7]]`. This is a single-request
+  runtime smoke, not full training or GPU parity, and not a per-block fallback.
+
+Recorded dense CPU smoke command:
+
+```bash
+python refactor_debugging/blockwise/smoke_sglang_ebft_dense_mask.py --mask-mode dense4d --attention-backend torch_native --device cpu --generate-length 2 --num-blocks 2 --grammar-backend none --startup-timeout 180 --server-log-path /tmp/ebft_dense_block_source_real_contract_cpu.log --log-lines 120
+```
+
+Recorded sparse GPU smoke command:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python refactor_debugging/blockwise/smoke_sglang_ebft_dense_mask.py --mask-mode sparse_ir --attention-backend triton --device cuda --generate-length 2 --num-blocks 2 --grammar-backend none --startup-timeout 300 --port 34915 --server-log-path /tmp/ebft_sparse_block_source_real_contract_gpu3_34915.log --log-lines 150
+```
+
+For launcher-level smoke without starting GPU/Ray training:
+
+```bash
+PRINT_ONLY=1 \
+G1_FILTER_TRAIN_DATA=false \
+SGLANG_ATTENTION_BACKEND=triton \
+SGLANG_GRAMMAR_BACKEND=none \
+exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh
+```
+
 ## Validation Commands
 
 From the repository root:
@@ -262,6 +375,7 @@ python refactor_debugging/blockwise/inspect_blockwise_contract.py --json
 Focused CPU tests:
 
 ```bash
+pytest tests/test_g1_ebft_rollout_mask.py
 pytest tests/test_g1_ebft_launcher_contract.py
 pytest tests/test_strict_blockwise_contract.py
 pytest tests/test_g1_ebft_arguments.py
@@ -274,12 +388,24 @@ Combined strict EBFT CPU pass:
 
 ```bash
 pytest \
+  tests/test_g1_ebft_rollout_mask.py \
   tests/test_g1_ebft_launcher_contract.py \
   tests/test_strict_blockwise_contract.py \
   tests/test_g1_ebft_arguments.py \
   tests/test_g1_ebft_data_contract.py \
   tests/test_g1_ebft_loss.py \
   tests/test_g1_ebft_strict_smoke.py
+```
+
+Final recorded result for the current handoff matrix:
+
+```text
+Slime pytest: 77 passed, 4 skipped
+validators: pass
+launcher PRINT_ONLY dense/sparse: pass
+SGLang py_compile/diff: pass
+dense4d torch_native block_source runtime smoke: PASS, single /generate request, not per-block fallback; HTTP 200, output_ids [148, 18, 10, 12], length 4, ebft_sample_source_rows [[1, 3], [6, 7]]
+sparse_ir triton block_source runtime smoke: PASS, single /generate request, not per-block fallback; HTTP 200, output_ids [144, 8, 10, 79], length 4, ebft_sample_source_rows [[1, 3], [6, 7]]
 ```
 
 ## Debug Preflight Script
@@ -315,8 +441,71 @@ python refactor_debugging/blockwise/inspect_blockwise_contract.py \
 
 The command exits nonzero if any built-in contract check fails.
 
+## Rollout Mask Contract Helper
+
+`slime/utils/g1_ebft_rollout_mask.py` now contains the first Slime-side
+CPU-only strict rollout mask contract helper. It builds the time-major response
+positions, full position ids, rollout mask source rows/source kinds, generated
+target positions, optional QA/doc metadata projection, and a single sparse
+span IR. Dense bool/additive masks and the span sparse IR are projections from
+the same allowed-edge CPU contract. The helper also calls the existing strict
+trainer pair-axis builder so the generated target order stays aligned with
+`strict_block_source` loss semantics.
+
+The sparse IR payload is now `version=1`, `layout=ebft_block_strided_v1`, with
+logical sequence geometry (`seq_len`, `query_len`, `prefix_len`) and CSR-style
+span arrays (`q_indptr`, `span_starts`, `span_ends`). Spans are half-open
+logical key-position intervals `[start, end)`, with contiguous keys merged. A
+CPU converter validates this IR and reconstructs the dense allowed matrix for
+tests and future torch-native oracle checks.
+
+## SGLang Rollout Payload Status
+
+Slime now exposes `--g1-ebft-rollout-sampling-mode {standard,block_source}` and
+`--g1-ebft-rollout-mask-mode {none,dense4d,sparse_ir}`. The default
+`sampling=standard, mask=none` path leaves ordinary SGLang `/generate` payloads
+unchanged.
+
+Blunt status: mask/position transport and dense/sparse smoke coverage are
+verified, and `block_source` is allowed for any valid positive
+`generate_length` on the two experimental runtime pairs: dense4d with
+torch-native attention, or sparse_ir with Triton attention. `block_source` is
+rejected unless overlap schedule is disabled.
+Mask modes still fail under standard sampling so mask-only transport cannot be
+mistaken for strict EBFT rollout. Slime defensively forces `ignore_eos=True`
+and clears stop strings/token ids for block-source requests so SGLang cannot
+end the fixed EBFT response early.
+
+For both paths, Slime attaches a single-request EBFT payload:
+
+- common fields: `ebft_rollout_sampling_mode=block_source`,
+  `ebft_mask_spec`, `ebft_position_ids`
+- dense mode: `ebft_dense_attention_mask`
+- sparse mode: `ebft_sparse_ir`
+
+`ebft_mask_spec.rollout_source_rows` are sampling logit rows, not token anchor
+rows. For the tiny `prompt_length=6, context_length=2, stride=2,
+generate_length=2` fixture, rollout/logprob source rows are `[1, 3, 6, 7]`,
+while the token anchors remain `[2, 4, 3, 5]` in
+`rollout_anchor_positions`/`response_positions`.
+
+The Slime-side rollout builder fails fast if the sample lacks prompt QA/doc
+metadata, if the request is not first-turn strict G1 generation, or if
+`input_ids`/`max_new_tokens` do not match the configured strict G1 geometry. It
+does not implement per-block `/generate` requests. The sparse mode only changes
+the request payload contract; SGLang runtime consumption has only been verified
+by the single-request `sparse_ir` + Triton smoke, not by full training or GPU
+parity.
+
 ## Current Limitations
 
+- Runtime smoke is restricted to a single request with no overlap scheduling.
+- Streaming, session, multimodal, and speculative decoding paths are out of
+  scope for this payload contract.
+- Dense and sparse mask payloads must not be mixed in one request.
+- Sparse IR is accepted for `block_source` only with Triton attention and
+  overlap schedule disabled; it requires a GPU. Dense mode uses
+  `torch_native`; dense fallback from sparse is intentionally rejected.
 - No GPU/Ray parity run has been completed for this strict path.
 - No confirmed parity report against OpenRLHF EBFT runtime tensors/logprobs is
   checked in yet.
