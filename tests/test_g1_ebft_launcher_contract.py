@@ -7,7 +7,9 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OLD_SLIME_ROOT = Path("/mnt/data/distribution-matching-slime/code/slime-0.2.4")
+# Keep this distinct from whichever checkout is running the test so the
+# negative TRAIN_ENTRY assertion exercises the inherited-root guard.
+OLD_SLIME_ROOT = REPO_ROOT.with_name(f"{REPO_ROOT.name}_old")
 MAIN_LAUNCHER = REPO_ROOT / "exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_main.sh"
 STRICT_LAUNCHER = REPO_ROOT / "exper_scripts/main_test/run_g1_ebft_gt_qwen35_2b_strict_block_source.sh"
 
@@ -185,6 +187,8 @@ def test_main_launcher_print_only_adds_experimental_block_source_flags(
 
 
 def test_launcher_ignores_inherited_old_slime_root_for_train_entry(launcher_env: dict[str, str]) -> None:
+    assert OLD_SLIME_ROOT != REPO_ROOT
+
     env = launcher_env.copy()
     env["SLIME_ROOT"] = str(OLD_SLIME_ROOT)
 
