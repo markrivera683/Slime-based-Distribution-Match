@@ -139,9 +139,11 @@ SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-4096}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.7}"
 SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
+SGLANG_DISABLE_OVERLAP_SCHEDULE="${SGLANG_DISABLE_OVERLAP_SCHEDULE:-true}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
-SGLANG_ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-}"
+SGLANG_ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-triton}"
 SGLANG_SAMPLING_BACKEND="${SGLANG_SAMPLING_BACKEND:-}"
+SGLANG_GRAMMAR_BACKEND="${SGLANG_GRAMMAR_BACKEND:-none}"
 SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER="${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER:-true}"
 SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT="${SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT:-/health_generate}"
 SGLANG_DIRECT_WORKER_MODE="${SGLANG_DIRECT_WORKER_MODE:-false}"
@@ -221,7 +223,7 @@ EFFOPD_FORCE_WEIGHT_SYNC="${EFFOPD_FORCE_WEIGHT_SYNC:-true}"
 # ---------------------------------------------------------------------------
 # 7. G1 embedding/reward path used by G2
 # ---------------------------------------------------------------------------
-G1_USE_EBFT_LOSS="${G1_USE_EBFT_LOSS:-false}"
+G1_USE_EBFT_LOSS="${G1_USE_EBFT_LOSS:-true}"
 G1_APPLY_DENSE_ATTENTION_MASK="${G1_APPLY_DENSE_ATTENTION_MASK:-false}"
 G1_QA_MASKING="${G1_QA_MASKING:-false}"
 G1_CE_LOSS_COEF="${G1_CE_LOSS_COEF:-0.03}"
@@ -234,6 +236,9 @@ G1_HIDDEN_STATE_METHOD="${G1_HIDDEN_STATE_METHOD:-last_only}"
 G1_EMBEDDING_SOURCE="${G1_EMBEDDING_SOURCE:-megatron_ref}"
 G1_REWARD_LOCATION="${G1_REWARD_LOCATION:-trainer}"
 G1_REF_FORWARD_MODE="${G1_REF_FORWARD_MODE:-openrlhf_exact}"
+G1_EBFT_LOGPROB_INDEXING="${G1_EBFT_LOGPROB_INDEXING:-strict_block_source}"
+G1_EBFT_ROLLOUT_SAMPLING_MODE="${G1_EBFT_ROLLOUT_SAMPLING_MODE:-block_source}"
+G1_EBFT_ROLLOUT_MASK_MODE="${G1_EBFT_ROLLOUT_MASK_MODE:-sparse_ir}"
 USE_WHITENING="${USE_WHITENING:-true}"
 
 # ---------------------------------------------------------------------------
@@ -463,7 +468,7 @@ source_slime_env() {
     # shellcheck disable=SC1090
     source "${SLIME_ENV_FILE}"
   fi
-  if [[ -d "${VIRTUAL_ENV:-}/bin" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -d "${VIRTUAL_ENV}/bin" ]]; then
     export PATH="${VIRTUAL_ENV}/bin:${PATH}"
   elif [[ -d "$(dirname "${PYTHON_BIN}")" ]]; then
     export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
@@ -751,8 +756,55 @@ require_bool "TEACHER_SGLANG_MULTI_SAMPLE" "${TEACHER_SGLANG_MULTI_SAMPLE}"
 require_bool "ENABLE_SLIME_EVAL" "${ENABLE_SLIME_EVAL}"
 require_bool "ENABLE_G2_POST_EVAL" "${ENABLE_G2_POST_EVAL}"
 require_bool "SGLANG_DISABLE_CUDA_GRAPH" "${SGLANG_DISABLE_CUDA_GRAPH}"
+require_bool "SGLANG_DISABLE_OVERLAP_SCHEDULE" "${SGLANG_DISABLE_OVERLAP_SCHEDULE}"
 require_bool "SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER" "${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER}"
 require_bool "SGLANG_DIRECT_WORKER_MODE" "${SGLANG_DIRECT_WORKER_MODE}"
+case "${G1_EBFT_LOGPROB_INDEXING}" in
+  standard_next_token|strict_block_source) ;;
+  *) echo "[ERROR] G1_EBFT_LOGPROB_INDEXING must be standard_next_token or strict_block_source, got: ${G1_EBFT_LOGPROB_INDEXING}" >&2; exit 1 ;;
+esac
+case "${G1_EBFT_ROLLOUT_MASK_MODE}" in
+  none|dense4d|sparse_ir) ;;
+  *) echo "[ERROR] G1_EBFT_ROLLOUT_MASK_MODE must be none, dense4d, or sparse_ir, got: ${G1_EBFT_ROLLOUT_MASK_MODE}" >&2; exit 1 ;;
+esac
+case "${G1_EBFT_ROLLOUT_SAMPLING_MODE}" in
+  standard|block_source) ;;
+  *) echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE must be standard or block_source, got: ${G1_EBFT_ROLLOUT_SAMPLING_MODE}" >&2; exit 1 ;;
+esac
+if [[ "${G1_EBFT_ROLLOUT_SAMPLING_MODE}" == "block_source" ]]; then
+  if [[ "${G1_USE_EBFT_LOSS}" != "true" ]]; then
+    echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source requires G1_USE_EBFT_LOSS=true" >&2
+    exit 1
+  fi
+  if [[ "${G1_EBFT_LOGPROB_INDEXING}" != "strict_block_source" ]]; then
+    echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source requires G1_EBFT_LOGPROB_INDEXING=strict_block_source" >&2
+    exit 1
+  fi
+  if [[ "${G1_EBFT_ROLLOUT_MASK_MODE}" != "dense4d" && "${G1_EBFT_ROLLOUT_MASK_MODE}" != "sparse_ir" ]]; then
+    echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source requires G1_EBFT_ROLLOUT_MASK_MODE=dense4d or sparse_ir" >&2
+    exit 1
+  fi
+  if [[ "${G1_EBFT_ROLLOUT_MASK_MODE}" == "dense4d" && "${SGLANG_ATTENTION_BACKEND}" != "torch_native" ]]; then
+    echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source with dense4d requires SGLANG_ATTENTION_BACKEND=torch_native" >&2
+    exit 1
+  fi
+  if [[ "${G1_EBFT_ROLLOUT_MASK_MODE}" == "sparse_ir" && "${SGLANG_ATTENTION_BACKEND}" != "triton" ]]; then
+    echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source with sparse_ir requires SGLANG_ATTENTION_BACKEND=triton" >&2
+    exit 1
+  fi
+  if [[ "${SGLANG_DISABLE_OVERLAP_SCHEDULE}" != "true" ]]; then
+    echo "[ERROR] G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source requires SGLANG_DISABLE_OVERLAP_SCHEDULE=true" >&2
+    exit 1
+  fi
+fi
+if [[ "${G1_EBFT_ROLLOUT_MASK_MODE}" != "none" && "${G1_EBFT_ROLLOUT_SAMPLING_MODE}" == "standard" ]]; then
+  echo "[ERROR] G1_EBFT_ROLLOUT_MASK_MODE=${G1_EBFT_ROLLOUT_MASK_MODE} is transport only and requires block_source sampling; standard sampling cannot consume EBFT rollout masks" >&2
+  exit 1
+fi
+case "${SGLANG_GRAMMAR_BACKEND}" in
+  none|xgrammar|outlines|llguidance) ;;
+  *) echo "[ERROR] SGLANG_GRAMMAR_BACKEND must be none, xgrammar, outlines, or llguidance, got: ${SGLANG_GRAMMAR_BACKEND}" >&2; exit 1 ;;
+esac
 
 case "${DEPLOY_LAYOUT}" in
   single_node|two_node) ;;
@@ -1104,6 +1156,13 @@ CMD=(
   --g1-megatron-ref-forward-mode "${G1_REF_FORWARD_MODE}"
   --g1-ce-loss-coef "${G1_CE_LOSS_COEF}"
 )
+CMD+=(
+  --g1-ebft-logprob-indexing "${G1_EBFT_LOGPROB_INDEXING}"
+  --g1-ebft-rollout-sampling-mode "${G1_EBFT_ROLLOUT_SAMPLING_MODE}"
+  --g1-ebft-rollout-mask-mode "${G1_EBFT_ROLLOUT_MASK_MODE}"
+  --sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}"
+  --sglang-grammar-backend "${SGLANG_GRAMMAR_BACKEND}"
+)
 if [[ -n "${NUM_ROLLOUT}" ]]; then
   require_positive_int "NUM_ROLLOUT" "${NUM_ROLLOUT}"
   CMD+=(--num-rollout "${NUM_ROLLOUT}")
@@ -1129,11 +1188,11 @@ fi
 if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" == "true" ]]; then
   CMD+=(--sglang-disable-cuda-graph)
 fi
+if [[ "${SGLANG_DISABLE_OVERLAP_SCHEDULE}" == "true" ]]; then
+  CMD+=(--sglang-disable-overlap-schedule)
+fi
 if [[ -n "${SGLANG_MAX_RUNNING_REQUESTS}" ]]; then
   CMD+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
-fi
-if [[ -n "${SGLANG_ATTENTION_BACKEND}" ]]; then
-  CMD+=(--sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}")
 fi
 if [[ -n "${SGLANG_SAMPLING_BACKEND}" ]]; then
   CMD+=(--sglang-sampling-backend "${SGLANG_SAMPLING_BACKEND}")
@@ -1275,9 +1334,11 @@ SGLANG_CONTEXT_LENGTH=${SGLANG_CONTEXT_LENGTH}
 SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY}
 SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC}
 SGLANG_DISABLE_CUDA_GRAPH=${SGLANG_DISABLE_CUDA_GRAPH}
+SGLANG_DISABLE_OVERLAP_SCHEDULE=${SGLANG_DISABLE_OVERLAP_SCHEDULE}
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS}
 SGLANG_ATTENTION_BACKEND=${SGLANG_ATTENTION_BACKEND}
 SGLANG_SAMPLING_BACKEND=${SGLANG_SAMPLING_BACKEND}
+SGLANG_GRAMMAR_BACKEND=${SGLANG_GRAMMAR_BACKEND}
 SGLANG_503_DEBUG_MODE=${SGLANG_503_DEBUG_MODE}
 SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER=${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER}
 SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT=${SGLANG_ROUTER_HEALTH_CHECK_ENDPOINT}
@@ -1335,6 +1396,9 @@ G1_HIDDEN_STATE_METHOD=${G1_HIDDEN_STATE_METHOD}
 G1_EMBEDDING_SOURCE=${G1_EMBEDDING_SOURCE}
 G1_REWARD_LOCATION=${G1_REWARD_LOCATION}
 G1_REF_FORWARD_MODE=${G1_REF_FORWARD_MODE}
+G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING}
+G1_EBFT_ROLLOUT_SAMPLING_MODE=${G1_EBFT_ROLLOUT_SAMPLING_MODE}
+G1_EBFT_ROLLOUT_MASK_MODE=${G1_EBFT_ROLLOUT_MASK_MODE}
 USE_WHITENING=${USE_WHITENING}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 ATTENTION_DROPOUT=${ATTENTION_DROPOUT}
@@ -1389,6 +1453,8 @@ echo "[layout] teacher node: 8 GPU scorer, default TEACHER_CUDA_VISIBLE_DEVICES=
 echo "[layout] student node: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}; actor=${ACTOR_NUM_GPUS_PER_NODE}, critic=${CRITIC_NUM_GPUS_PER_NODE}, rollout=${ROLLOUT_NUM_GPUS} (${ROLLOUT_NUM_GPUS_PER_ENGINE} GPU/engine)"
 echo "[preflight] NUM_GPUS=${NUM_GPUS} ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE} CRITIC_NUM_NODES=${CRITIC_NUM_NODES} CRITIC_NUM_GPUS_PER_NODE=${CRITIC_NUM_GPUS_PER_NODE} ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS} COLOCATE=${COLOCATE} TRAIN_ENTRYPOINT=${TRAIN_ENTRYPOINT}"
 echo "[preflight] TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} ACTOR_DP=${DP_SIZE}"
+echo "[preflight] SGLANG_ATTENTION_BACKEND=${SGLANG_ATTENTION_BACKEND} SGLANG_DISABLE_OVERLAP_SCHEDULE=${SGLANG_DISABLE_OVERLAP_SCHEDULE} SGLANG_GRAMMAR_BACKEND=${SGLANG_GRAMMAR_BACKEND}"
+echo "[preflight] G1_EBFT_LOGPROB_INDEXING=${G1_EBFT_LOGPROB_INDEXING} G1_EBFT_ROLLOUT_SAMPLING_MODE=${G1_EBFT_ROLLOUT_SAMPLING_MODE} G1_EBFT_ROLLOUT_MASK_MODE=${G1_EBFT_ROLLOUT_MASK_MODE}"
 echo "[submit] command:"
 print_shell_command "${CMD[@]}"
 echo "[artifact] ${ARTIFACT_DIR}"
