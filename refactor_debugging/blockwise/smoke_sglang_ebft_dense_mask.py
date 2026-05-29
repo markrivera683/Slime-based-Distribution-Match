@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -119,6 +120,23 @@ def build_server_cmd(args: argparse.Namespace) -> list[str]:
         cmd.extend(["--grammar-backend", args.grammar_backend])
     cmd.extend(args.server_args)
     return cmd
+
+
+def build_server_env(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{SGLANG_PYTHON}:{env.get('PYTHONPATH', '')}"
+    if args.device == "cpu":
+        env.setdefault("SGLANG_USE_CPU_ENGINE", "1")
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    return env
+
+
+def format_server_cmd_for_print(args: argparse.Namespace, env: dict[str, str], cmd: list[str]) -> str:
+    env_keys = ["PYTHONPATH"]
+    if args.device == "cpu":
+        env_keys = ["CUDA_VISIBLE_DEVICES", "SGLANG_USE_CPU_ENGINE", *env_keys]
+    env_prefix = " ".join(f"{key}={shlex.quote(env[key])}" for key in env_keys)
+    return f"{env_prefix} {' '.join(shlex.quote(part) for part in cmd)}"
 
 
 def jsonable(value: Any) -> Any:
@@ -309,13 +327,12 @@ def main() -> int:
     if args.port == 0:
         args.port = pick_free_port(args.host)
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{SGLANG_PYTHON}:{env.get('PYTHONPATH', '')}"
+    env = build_server_env(args)
     cmd = build_server_cmd(args)
     payload = build_generate_payload(args)
 
     print("Server command:")
-    print("PYTHONPATH=/root/slime_runtime/sglang/python " + " ".join(cmd))
+    print(format_server_cmd_for_print(args, env, cmd))
     print("\n/generate payload:")
     print(json.dumps(payload, indent=2))
 
