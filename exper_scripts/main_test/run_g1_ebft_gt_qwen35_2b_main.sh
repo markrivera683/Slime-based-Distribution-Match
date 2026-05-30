@@ -160,18 +160,18 @@ G1_HIDDEN_STATE_METHOD="${G1_HIDDEN_STATE_METHOD:-last_only}"
 G1_EMBEDDING_SOURCE="${G1_EMBEDDING_SOURCE:-megatron_ref}"
 G1_REWARD_LOCATION="${G1_REWARD_LOCATION:-trainer}"
 G1_REF_FORWARD_MODE="${G1_REF_FORWARD_MODE:-openrlhf_exact}"
-G1_EBFT_PROFILE="${G1_EBFT_PROFILE:-standard}"
+G1_EBFT_PROFILE="${G1_EBFT_PROFILE:-strict_block_source}"
 case "${G1_EBFT_PROFILE}" in
-  default|standard) G1_EBFT_PROFILE="standard" ;;
-  strict_block_source) ;;
+  default|strict_block_source) G1_EBFT_PROFILE="strict_block_source" ;;
+  standard) ;;
   *) echo "[ERROR] G1_EBFT_PROFILE must be default, standard, or strict_block_source, got: ${G1_EBFT_PROFILE}" >&2; exit 1 ;;
 esac
 USER_SET_G1_EBFT_LOGPROB_INDEXING="${G1_EBFT_LOGPROB_INDEXING+x}"
 USER_SET_G1_EBFT_ROLLOUT_SAMPLING_MODE="${G1_EBFT_ROLLOUT_SAMPLING_MODE+x}"
 USER_SET_G1_EBFT_ROLLOUT_MASK_MODE="${G1_EBFT_ROLLOUT_MASK_MODE+x}"
-# Leave logprob indexing unset in the standard profile so the Slime parser
-# supplies its standard_next_token default. The strict profile below enables
-# true rollout-time block_source transport by default.
+# Leave logprob indexing unset only in the explicit standard opt-out profile so
+# the Slime parser supplies its standard_next_token default. Default launches
+# use true rollout-time block_source transport.
 G1_EBFT_LOGPROB_INDEXING="${G1_EBFT_LOGPROB_INDEXING:-}"
 G1_EBFT_ROLLOUT_SAMPLING_MODE="${G1_EBFT_ROLLOUT_SAMPLING_MODE:-standard}"
 G1_EBFT_ROLLOUT_MASK_MODE="${G1_EBFT_ROLLOUT_MASK_MODE:-none}"

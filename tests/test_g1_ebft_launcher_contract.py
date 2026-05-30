@@ -124,6 +124,12 @@ def _strict_profile_env(env: dict[str, str]) -> dict[str, str]:
     return strict_env
 
 
+def _standard_profile_env(env: dict[str, str]) -> dict[str, str]:
+    standard_env = env.copy()
+    standard_env["G1_EBFT_PROFILE"] = "standard"
+    return standard_env
+
+
 def _assert_strict_blockwise_profile(output: str) -> None:
     assert "--g1-ebft-logprob-indexing strict_block_source" in output
     assert "--g1-ebft-rollout-sampling-mode block_source" in output
@@ -143,8 +149,26 @@ def _assert_strict_blockwise_profile(output: str) -> None:
     ) in output
 
 
-def test_main_launcher_print_only_uses_launcher_default_logprob_indexing(launcher_env: dict[str, str]) -> None:
+def test_main_launcher_print_only_defaults_to_strict_blockwise_profile(launcher_env: dict[str, str]) -> None:
     output = _run_launcher(MAIN_LAUNCHER, launcher_env)
+
+    _assert_strict_blockwise_profile(output)
+    context = _run_context(launcher_env)
+    assert "G1_EBFT_PROFILE=strict_block_source" in context
+    assert "G1_EBFT_LOGPROB_INDEXING=strict_block_source" in context
+    assert "G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source" in context
+    assert "G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir" in context
+    assert "SGLANG_ATTENTION_BACKEND=triton" in context
+    assert "SGLANG_DISABLE_OVERLAP_SCHEDULE=true" in context
+    assert "SGLANG_GRAMMAR_BACKEND=none" in context
+
+
+def test_main_launcher_print_only_standard_profile_opt_out_uses_launcher_defaults(
+    launcher_env: dict[str, str],
+) -> None:
+    env = _standard_profile_env(launcher_env)
+
+    output = _run_launcher(MAIN_LAUNCHER, env)
 
     assert "--g1-ebft-logprob-indexing" not in output
     assert "--g1-ebft-rollout-sampling-mode" not in output
@@ -157,10 +181,14 @@ def test_main_launcher_print_only_uses_launcher_default_logprob_indexing(launche
         "[preflight] G1_EBFT_ROLLOUT_SAMPLING_MODE=standard "
         "G1_EBFT_ROLLOUT_MASK_MODE=none SGLANG_GRAMMAR_BACKEND=launcher-default"
     ) in output
-    assert "G1_EBFT_PROFILE=standard" in _run_context(launcher_env)
+    context = _run_context(env)
+    assert "G1_EBFT_PROFILE=standard" in context
+    assert "G1_EBFT_LOGPROB_INDEXING=" in context
+    assert "G1_EBFT_ROLLOUT_SAMPLING_MODE=standard" in context
+    assert "G1_EBFT_ROLLOUT_MASK_MODE=none" in context
 
 
-def test_strict_profile_print_only_adds_strict_block_source_blockwise_profile(
+def test_explicit_strict_profile_print_only_adds_strict_block_source_blockwise_profile(
     launcher_env: dict[str, str],
 ) -> None:
     env = _strict_profile_env(launcher_env)
@@ -252,8 +280,14 @@ def test_main_launcher_print_only_with_fake_build_script_does_not_bootstrap(
 
     output = _run_launcher(MAIN_LAUNCHER, env)
 
-    assert "[preflight] G1_EBFT_PROFILE=standard" in output
+    assert "[preflight] G1_EBFT_PROFILE=strict_block_source" in output
+    assert "[preflight] G1_EBFT_LOGPROB_INDEXING=strict_block_source" in output
     assert not marker.exists()
+    context = _run_context(env)
+    assert "G1_EBFT_PROFILE=strict_block_source" in context
+    assert "G1_EBFT_LOGPROB_INDEXING=strict_block_source" in context
+    assert "G1_EBFT_ROLLOUT_SAMPLING_MODE=block_source" in context
+    assert "G1_EBFT_ROLLOUT_MASK_MODE=sparse_ir" in context
 
 
 def test_launcher_ignores_inherited_old_slime_root_for_train_entry(launcher_env: dict[str, str]) -> None:
@@ -268,3 +302,7 @@ def test_launcher_ignores_inherited_old_slime_root_for_train_entry(launcher_env:
     assert f"[preflight] TRAIN_ENTRY={REPO_ROOT}/train_async.py" in output
     assert "TRAIN_ENTRYPOINT=train_async.py" in output
     assert str(OLD_SLIME_ROOT / "train_async.py") not in output
+    context = _run_context(env)
+    assert f"SLIME_ROOT={REPO_ROOT}" in context
+    assert f"LAUNCHER_SLIME_ROOT={REPO_ROOT}" in context
+    assert "G1_EBFT_PROFILE=strict_block_source" in context
