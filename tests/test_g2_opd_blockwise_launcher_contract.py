@@ -126,6 +126,7 @@ def test_g2_opd_cf_l1oo_launchers_print_blockwise_flags(script: Path, launcher_e
     assert "--distribution-reward-type cf_l1oo" in output
     assert "--opd-credit-assignment cf_l1oo" in output
     assert "--cf-target-mode opd_onpolicy" in output
+    assert "--g3-enable" not in output
     assert output.count("--g1-use-ebft-loss") == 1
     assert output.count("--g1-ebft-logprob-indexing strict_block_source") == 1
     assert output.count("--g1-ebft-rollout-sampling-mode block_source") == 1
@@ -157,6 +158,7 @@ def test_g2_opd_cf_l1oo_launchers_print_blockwise_flags(script: Path, launcher_e
     assert "SGLANG_ATTENTION_BACKEND=triton" in context
     assert "SGLANG_DISABLE_OVERLAP_SCHEDULE=true" in context
     assert "SGLANG_GRAMMAR_BACKEND=none" in context
+    assert "G3_ENABLE=false" in context_lines
     if script.name.endswith("_1node8.sh"):
         assert "TEACHER_CUDA_VISIBLE_DEVICES=0,1,2,3" in context_lines
         assert "TEACHER_NUM_GPUS=4" in context_lines
@@ -167,3 +169,39 @@ def test_g2_opd_cf_l1oo_launchers_print_blockwise_flags(script: Path, launcher_e
         assert "CUDA_VISIBLE_DEVICES=4,5,6,7" in context_lines
         assert "NUM_GPUS=4" in context_lines
         assert "RAY_NUM_GPUS=4" in context_lines
+
+
+@pytest.mark.parametrize("script", LAUNCHERS)
+def test_g2_opd_cf_l1oo_launchers_print_optional_g3_flags(script: Path, launcher_env: dict[str, str]) -> None:
+    launcher_env.update(
+        {
+            "G3_ENABLE": "true",
+            "FEATURE_ADAPTER_RANK": "8",
+            "FEATURE_ADAPTER_DROPOUT": "0.1",
+            "EMA_BETA": "0.9",
+            "G3_ADAPTER_LR": "1e-4",
+            "G3_FEATURE_LOSS_COEF": "0.25",
+        }
+    )
+
+    output = _run_launcher(script, launcher_env)
+
+    assert output.count("--g3-enable") == 1
+    assert output.count("--feature-adapter-enable") == 1
+    assert output.count("--enable-ema") == 1
+    assert "--feature-adapter-rank 8" in output
+    assert "--feature-adapter-dropout 0.1" in output
+    assert "--ema-beta 0.9" in output
+    assert "--g3-adapter-lr 1e-4" in output
+    assert "--g3-feature-loss-coef 0.25" in output
+
+    run_context = Path(launcher_env["ARTIFACT_DIR"]) / "run_context.env"
+    context_lines = set(run_context.read_text(encoding="utf-8").splitlines())
+    assert "G3_ENABLE=true" in context_lines
+    assert "FEATURE_ADAPTER_ENABLE=true" in context_lines
+    assert "FEATURE_ADAPTER_RANK=8" in context_lines
+    assert "FEATURE_ADAPTER_DROPOUT=0.1" in context_lines
+    assert "ENABLE_EMA=true" in context_lines
+    assert "EMA_BETA=0.9" in context_lines
+    assert "G3_ADAPTER_LR=1e-4" in context_lines
+    assert "G3_FEATURE_LOSS_COEF=0.25" in context_lines

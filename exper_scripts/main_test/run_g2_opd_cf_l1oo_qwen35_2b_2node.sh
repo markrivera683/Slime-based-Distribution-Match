@@ -25,17 +25,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER_SLIME_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---------------------------------------------------------------------------
 # 0. Runtime paths
 # ---------------------------------------------------------------------------
-SLIME_ROOT="${SLIME_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SLIME_ROOT}/../.." && pwd)}"
 MEGATRON_PATH="${MEGATRON_PATH:-/root/slime_runtime/Megatron-LM}"
 SLIME_ENV_FILE="${SLIME_ENV_FILE:-/root/slime_runtime/slime_env.sh}"
 PYTHON_BIN="${PYTHON_BIN:-/root/venvs/slime/bin/python}"
 RAY_BIN="${RAY_BIN:-$(dirname "${PYTHON_BIN}")/ray}"
-BUILD_SCRIPT="${BUILD_SCRIPT:-${SLIME_ROOT}/build_conda.sh}"
+BUILD_SCRIPT="${LAUNCHER_SLIME_ROOT}/build_conda.sh"
 
 # DLC/PyTorchJob support. In DLC both pods can run this same script:
 # rank0/master starts the teacher, rank1/worker starts the student.
@@ -208,6 +209,7 @@ TEACHER_SYSTEM_PROMPT_ID="${TEACHER_SYSTEM_PROMPT_ID:-g2-opd-main-v1}"
 TEACHER_CACHE_ENABLE="${TEACHER_CACHE_ENABLE:-false}"
 TEACHER_CACHE_DIR="${TEACHER_CACHE_DIR:-/mnt/workspace/teacher_cache_shared}"
 TEACHER_MAX_RUNNING_REQUESTS="${TEACHER_MAX_RUNNING_REQUESTS:-16}"
+TEACHER_EXTRA_SGLANG_ARGS="${TEACHER_EXTRA_SGLANG_ARGS:---disable-cuda-graph --attention-backend triton --sampling-backend pytorch}"
 
 OPD_KL_COEF="${OPD_KL_COEF:-1.0}"
 OPD_TEACHER_RM_URL="${OPD_TEACHER_RM_URL:-${TEACHER_API_BASE%/}/generate}"
@@ -221,7 +223,19 @@ EFFOPD_MAX_TRIGGERS="${EFFOPD_MAX_TRIGGERS:--1}"
 EFFOPD_FORCE_WEIGHT_SYNC="${EFFOPD_FORCE_WEIGHT_SYNC:-true}"
 
 # ---------------------------------------------------------------------------
-# 7. G1 embedding/reward path used by G2
+# 7. Optional G3 EMA feature-adapter surface
+# ---------------------------------------------------------------------------
+G3_ENABLE="${G3_ENABLE:-false}"
+FEATURE_ADAPTER_ENABLE="${FEATURE_ADAPTER_ENABLE:-true}"
+FEATURE_ADAPTER_RANK="${FEATURE_ADAPTER_RANK:-64}"
+FEATURE_ADAPTER_DROPOUT="${FEATURE_ADAPTER_DROPOUT:-0.0}"
+ENABLE_EMA="${ENABLE_EMA:-true}"
+EMA_BETA="${EMA_BETA:-0.99}"
+G3_ADAPTER_LR="${G3_ADAPTER_LR:-5e-5}"
+G3_FEATURE_LOSS_COEF="${G3_FEATURE_LOSS_COEF:-0.1}"
+
+# ---------------------------------------------------------------------------
+# 8. G1 embedding/reward path used by G2
 # ---------------------------------------------------------------------------
 G1_USE_EBFT_LOSS="${G1_USE_EBFT_LOSS:-true}"
 G1_APPLY_DENSE_ATTENTION_MASK="${G1_APPLY_DENSE_ATTENTION_MASK:-false}"
@@ -468,6 +482,11 @@ source_slime_env() {
     # shellcheck disable=SC1090
     source "${SLIME_ENV_FILE}"
   fi
+  if [[ "${SLIME_ROOT:-}" != "${LAUNCHER_SLIME_ROOT}" ]]; then
+    echo "[dlc] overriding SLIME_ROOT from sourced env: ${SLIME_ROOT:-<unset>} -> ${LAUNCHER_SLIME_ROOT}"
+  fi
+  export SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
+  BUILD_SCRIPT="${LAUNCHER_SLIME_ROOT}/build_conda.sh"
   if [[ -n "${VIRTUAL_ENV:-}" && -d "${VIRTUAL_ENV}/bin" ]]; then
     export PATH="${VIRTUAL_ENV}/bin:${PATH}"
   elif [[ -d "$(dirname "${PYTHON_BIN}")" ]]; then
@@ -755,6 +774,10 @@ require_bool "TEACHER_CACHE_ENABLE" "${TEACHER_CACHE_ENABLE}"
 require_bool "TEACHER_SGLANG_MULTI_SAMPLE" "${TEACHER_SGLANG_MULTI_SAMPLE}"
 require_bool "ENABLE_SLIME_EVAL" "${ENABLE_SLIME_EVAL}"
 require_bool "ENABLE_G2_POST_EVAL" "${ENABLE_G2_POST_EVAL}"
+require_bool "G3_ENABLE" "${G3_ENABLE}"
+require_bool "FEATURE_ADAPTER_ENABLE" "${FEATURE_ADAPTER_ENABLE}"
+require_bool "ENABLE_EMA" "${ENABLE_EMA}"
+require_positive_int "FEATURE_ADAPTER_RANK" "${FEATURE_ADAPTER_RANK}"
 require_bool "SGLANG_DISABLE_CUDA_GRAPH" "${SGLANG_DISABLE_CUDA_GRAPH}"
 require_bool "SGLANG_DISABLE_OVERLAP_SCHEDULE" "${SGLANG_DISABLE_OVERLAP_SCHEDULE}"
 require_bool "SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER" "${SGLANG_ROUTER_DISABLE_CIRCUIT_BREAKER}"
@@ -1255,6 +1278,22 @@ if [[ "${ENABLE_EFFOPD}" == "true" ]]; then
     CMD+=(--no-effopd-force-weight-sync)
   fi
 fi
+if [[ "${G3_ENABLE}" == "true" ]]; then
+  CMD+=(
+    --g3-enable
+    --feature-adapter-rank "${FEATURE_ADAPTER_RANK}"
+    --feature-adapter-dropout "${FEATURE_ADAPTER_DROPOUT}"
+    --ema-beta "${EMA_BETA}"
+    --g3-adapter-lr "${G3_ADAPTER_LR}"
+    --g3-feature-loss-coef "${G3_FEATURE_LOSS_COEF}"
+  )
+  if [[ "${FEATURE_ADAPTER_ENABLE}" == "true" ]]; then
+    CMD+=(--feature-adapter-enable)
+  fi
+  if [[ "${ENABLE_EMA}" == "true" ]]; then
+    CMD+=(--enable-ema)
+  fi
+fi
 if [[ "${ENABLE_SLIME_EVAL}" == "true" ]]; then
   CMD+=(
     --eval-interval "${EVAL_INTERVAL}"
@@ -1382,6 +1421,14 @@ TEACHER_CACHE_ENABLE=${TEACHER_CACHE_ENABLE}
 TEACHER_CACHE_DIR=${TEACHER_CACHE_DIR}
 OPD_KL_COEF=${OPD_KL_COEF}
 OPD_TEACHER_RM_URL=${OPD_TEACHER_RM_URL}
+G3_ENABLE=${G3_ENABLE}
+FEATURE_ADAPTER_ENABLE=${FEATURE_ADAPTER_ENABLE}
+FEATURE_ADAPTER_RANK=${FEATURE_ADAPTER_RANK}
+FEATURE_ADAPTER_DROPOUT=${FEATURE_ADAPTER_DROPOUT}
+ENABLE_EMA=${ENABLE_EMA}
+EMA_BETA=${EMA_BETA}
+G3_ADAPTER_LR=${G3_ADAPTER_LR}
+G3_FEATURE_LOSS_COEF=${G3_FEATURE_LOSS_COEF}
 G1_USE_EBFT_LOSS=${G1_USE_EBFT_LOSS}
 G1_APPLY_DENSE_ATTENTION_MASK=${G1_APPLY_DENSE_ATTENTION_MASK}
 G1_QA_MASKING=${G1_QA_MASKING}

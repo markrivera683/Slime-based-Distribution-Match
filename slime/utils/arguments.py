@@ -15,6 +15,14 @@ from slime.utils.logging_utils import configure_logger
 logger = logging.getLogger(__name__)
 
 
+G3_CRITIC_CLOSURE_NOT_IMPLEMENTED = (
+    "G3 OPD-fused EMA is not runnable yet because the critic-side differentiable "
+    "adapter/EMA training closure is not implemented. Leave --g3-enable unset until "
+    "live adapter forward, EMA target forward, feature loss, adapter optimizer step, "
+    "and post-step EMA update are routed through the critic/Megatron closure."
+)
+
+
 def reset_arg(parser, name, **kwargs):
     """
     Reset the default value of a Megatron argument.
@@ -1417,6 +1425,49 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--teacher-cache-enable", action="store_true", default=False, help="Enable G2 teacher cache.")
             parser.add_argument("--teacher-cache-dir", type=str, default=None, help="Directory for G2 teacher cache.")
             parser.add_argument(
+                "--g3-enable",
+                action="store_true",
+                default=False,
+                help="Enable the G3 OPD-fused EMA feature-adapter mode.",
+            )
+            parser.add_argument(
+                "--feature-adapter-enable",
+                action="store_true",
+                default=False,
+                help="Enable the lightweight residual feature adapter used by G3.",
+            )
+            parser.add_argument(
+                "--feature-adapter-rank",
+                type=int,
+                default=64,
+                help="Bottleneck rank for the G3 residual feature adapter.",
+            )
+            parser.add_argument(
+                "--feature-adapter-dropout",
+                type=float,
+                default=0.0,
+                help="Dropout probability inside the G3 residual feature adapter.",
+            )
+            parser.add_argument(
+                "--enable-ema",
+                action="store_true",
+                default=False,
+                help="Enable EMA feature geometry for G3.",
+            )
+            parser.add_argument("--ema-beta", type=float, default=0.99, help="EMA decay beta for G3 feature geometry.")
+            parser.add_argument(
+                "--g3-adapter-lr",
+                type=float,
+                default=5e-5,
+                help="Learning rate for the G3 feature adapter optimizer.",
+            )
+            parser.add_argument(
+                "--g3-feature-loss-coef",
+                type=float,
+                default=0.1,
+                help="Coefficient for the G3 live-vs-EMA feature loss.",
+            )
+            parser.add_argument(
                 "--alignment-rew-coef",
                 type=float,
                 default=1.0,
@@ -1904,6 +1955,18 @@ def assert_g1_megatron_ref_trainer_stable_microbatch_order(args) -> None:
         )
 
 
+def assert_opd_cf_l1oo_args(args) -> None:
+    """Validate OPD-CF-L1OO credit-assignment knobs shared by G2 and G3."""
+    if not getattr(args, "use_opd", False):
+        raise ValueError("OPD-CF-L1OO requires --use-opd.")
+    if int(getattr(args, "n_samples_per_prompt", 1)) <= 1:
+        raise ValueError("OPD-CF-L1OO requires --n-samples-per-prompt > 1.")
+    if float(getattr(args, "opd_cf_score_temperature", 1.0)) <= 0.0:
+        raise ValueError("--opd-cf-score-temperature must be positive.")
+    if getattr(args, "opd_credit_assignment", "cf_l1oo") not in {"cf_l1oo", "ebft"}:
+        raise ValueError("--opd-credit-assignment must be 'cf_l1oo' or 'ebft'.")
+
+
 def assert_g2_standard_args(args) -> None:
     """Validate the intentionally narrow standard G2 surface."""
     if getattr(args, "distribution_reward_type", "pointwise") != "cf_l1oo":
@@ -1922,14 +1985,7 @@ def assert_g2_standard_args(args) -> None:
             "set --g1-embedding-source megatron_ref --g1-reward-location trainer."
         )
     if cf_target_mode == "opd_onpolicy":
-        if not getattr(args, "use_opd", False):
-            raise ValueError("OPD-CF-L1OO requires --use-opd.")
-        if int(getattr(args, "n_samples_per_prompt", 1)) <= 1:
-            raise ValueError("OPD-CF-L1OO requires --n-samples-per-prompt > 1.")
-        if float(getattr(args, "opd_cf_score_temperature", 1.0)) <= 0.0:
-            raise ValueError("--opd-cf-score-temperature must be positive.")
-        if getattr(args, "opd_credit_assignment", "cf_l1oo") not in {"cf_l1oo", "ebft"}:
-            raise ValueError("--opd-credit-assignment must be 'cf_l1oo' or 'ebft'.")
+        assert_opd_cf_l1oo_args(args)
     elif cf_target_mode == "single":
         if getattr(args, "teacher_backend", None) is not None:
             raise ValueError("G2 no-teacher distribution mode should not set --teacher-backend.")
@@ -1969,6 +2025,46 @@ def assert_g2_standard_args(args) -> None:
     zero_stage = getattr(args, "zero_stage", None)
     if zero_stage is not None and int(zero_stage) != 3:
         raise ValueError("Standard G2 expects --zero-stage 3.")
+
+
+def assert_g3_opd_fused_args(args) -> None:
+    """Validate then globally block the v1 G3 OPD-fused EMA surface."""
+    if not bool(getattr(args, "g3_enable", False)):
+        return
+
+    if getattr(args, "distribution_reward_type", "pointwise") != "cf_l1oo":
+        raise ValueError("G3 OPD-fused EMA requires --distribution-reward-type cf_l1oo.")
+    if getattr(args, "cf_target_mode", None) != "opd_onpolicy":
+        raise ValueError("G3 OPD-fused EMA requires --cf-target-mode opd_onpolicy.")
+    assert_opd_cf_l1oo_args(args)
+    if getattr(args, "opd_credit_assignment", "cf_l1oo") != "cf_l1oo":
+        raise ValueError("G3 OPD-fused EMA requires --opd-credit-assignment cf_l1oo.")
+    if not bool(getattr(args, "feature_adapter_enable", False)):
+        raise ValueError("G3 OPD-fused EMA requires --feature-adapter-enable.")
+    if not bool(getattr(args, "enable_ema", False)):
+        raise ValueError("G3 OPD-fused EMA requires --enable-ema.")
+    if getattr(args, "teacher_backend", None) is not None:
+        raise ValueError("G3 OPD-fused EMA uses OPD teacher scores and must not set --teacher-backend.")
+    if getattr(args, "teacher_api_base", None) or getattr(args, "teacher_model_name", None):
+        raise ValueError("G3 OPD-fused EMA uses OPD teacher scores and must not set teacher completion API arguments.")
+
+    if int(getattr(args, "feature_adapter_rank", 64)) <= 0:
+        raise ValueError("--feature-adapter-rank must be positive.")
+    feature_adapter_dropout = float(getattr(args, "feature_adapter_dropout", 0.0))
+    if feature_adapter_dropout < 0.0 or feature_adapter_dropout >= 1.0:
+        raise ValueError("--feature-adapter-dropout must be in [0, 1).")
+    ema_beta = float(getattr(args, "ema_beta", 0.99))
+    if ema_beta < 0.0 or ema_beta > 1.0:
+        raise ValueError("--ema-beta must be in [0, 1].")
+    if float(getattr(args, "g3_adapter_lr", 5e-5)) <= 0.0:
+        raise ValueError("--g3-adapter-lr must be positive.")
+    if float(getattr(args, "g3_feature_loss_coef", 0.1)) < 0.0:
+        raise ValueError("--g3-feature-loss-coef must be non-negative.")
+    if float(getattr(args, "critic_lr", 0.0)) != 0.0:
+        raise ValueError("G3 v1 does not train the critic backbone; keep --critic-lr 0.")
+    if float(getattr(args, "critic_lr_head", 0.0)) != 0.0:
+        raise ValueError("G3 v1 does not train the critic value head; keep --critic-lr-head 0.")
+    raise ValueError(G3_CRITIC_CLOSURE_NOT_IMPLEMENTED)
 
 
 def slime_validate_args(args):
@@ -2112,7 +2208,9 @@ def slime_validate_args(args):
             args.critic_lr_head = 0.0
 
     assert_g1_megatron_ref_trainer_stable_microbatch_order(args)
-    assert_g2_standard_args(args)
+    assert_g3_opd_fused_args(args)
+    if not bool(getattr(args, "g3_enable", False)):
+        assert_g2_standard_args(args)
 
     if bool(getattr(args, "g1_use_ebft_loss", False)):
         if getattr(args, "loss_type", None) != "policy_loss":

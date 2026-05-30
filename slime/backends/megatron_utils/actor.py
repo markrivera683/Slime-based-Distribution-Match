@@ -19,6 +19,7 @@ from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
+from slime.utils.g3_ema import G3EMAAdapterController, is_g3_opd_fused_mode, raise_if_g3_detached_reward_path
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
@@ -35,6 +36,7 @@ from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_da
 from .effopd import EffOPDController, EffOPDResult
 from .effopd.validate import score_from_terms, slice_rollout_data_for_indices
 from .g1_fast import compute_g1_token_advantages_from_embeddings
+from .g3_critic import run_g3_opd_critic_closure_from_embeddings
 from .initialize import init, is_megatron_main_rank
 from .loss import (
     collect_g1_runtime_dump_writer_metadata,
@@ -89,6 +91,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
         }
         self.effopd_controller = None
+        self.g3_ema_controller = None
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
@@ -327,6 +330,9 @@ class MegatronTrainRayActor(TrainRayActor):
             and getattr(self.args, "cf_target_mode", None) == "teacher"
         )
 
+    def _is_g3_opd_fused(self) -> bool:
+        return is_g3_opd_fused_mode(self.args)
+
     def _switch_model(self, target_tag: str) -> None:
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
@@ -470,6 +476,7 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> None:
         if self.args.g1_embedding_source != "megatron_ref" or self.args.g1_reward_location != "trainer":
             return
+        raise_if_g3_detached_reward_path(self.args)
         standard_g2 = self._is_standard_g2()
         required = ["g1_full_sequences", "g1_qa_masks"]
         missing = [key for key in required if key not in rollout_data]
@@ -644,6 +651,97 @@ class MegatronTrainRayActor(TrainRayActor):
                 teacher_by_sample[group_start + offset] = group_teacher
         rollout_data["g2_teacher_gen_embeddings"] = teacher_by_sample
 
+    def _get_g3_ema_controller(
+        self,
+        *,
+        feature_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> G3EMAAdapterController:
+        controller = getattr(self, "g3_ema_controller", None)
+        if controller is not None:
+            if int(controller.live_adapter.feature_dim) != int(feature_dim):
+                raise ValueError(
+                    "G3 feature adapter dimension changed across critic closure calls: "
+                    f"{controller.live_adapter.feature_dim} != {feature_dim}."
+                )
+            return controller
+
+        controller = G3EMAAdapterController.create(
+            feature_dim=int(feature_dim),
+            rank=int(getattr(self.args, "feature_adapter_rank", 64)),
+            dropout=float(getattr(self.args, "feature_adapter_dropout", 0.0)),
+            lr=float(getattr(self.args, "g3_adapter_lr", 5e-5)),
+            ema_beta=float(getattr(self.args, "ema_beta", 0.99)),
+            feature_loss_coef=float(getattr(self.args, "g3_feature_loss_coef", 0.1)),
+            device=device,
+            dtype=dtype,
+        )
+        self.g3_ema_controller = controller
+        return controller
+
+    def compute_g3_critic_token_advantages(self, rollout_data: RolloutBatch) -> None:
+        if not self._is_g3_opd_fused():
+            return
+
+        required = ["g1_full_sequences", "g1_qa_masks", "teacher_log_probs"]
+        missing = [key for key in required if key not in rollout_data]
+        if missing:
+            raise ValueError(f"G3 critic closure requires rollout_data keys {missing}")
+
+        g1_rollout_data = dict(rollout_data)
+        g1_rollout_data["tokens"] = rollout_data["g1_full_sequences"]
+        g1_rollout_data["total_lengths"] = [int(t.numel()) for t in g1_rollout_data["tokens"]]
+        g1_rollout_data["response_lengths"] = [int(self.args.g1_response_length)] * len(g1_rollout_data["tokens"])
+        g1_rollout_data["loss_masks"] = [
+            torch.ones(int(self.args.g1_response_length), dtype=torch.int, device=torch.cuda.current_device())
+            for _ in g1_rollout_data["tokens"]
+        ]
+        if self.args.qkv_format == "bshd":
+            max_seq_len = max(t.size(0) for t in g1_rollout_data["tokens"])
+            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
+            g1_rollout_data["max_seq_lens"] = [max_seq_len] * len(g1_rollout_data["tokens"])
+
+        g1_data_iterator, g1_num_microbatches = get_data_iterator(self.args, self.model, g1_rollout_data)
+        try:
+            with timer("g3_critic_megatron_embeddings"):
+                embeddings = forward_only(
+                    get_g1_embeddings_from_hidden_states,
+                    self.args,
+                    self.model,
+                    g1_data_iterator,
+                    g1_num_microbatches,
+                    collect_hidden_states=True,
+                    extra_batch_keys=["g1_qa_masks"],
+                )
+            if not embeddings:
+                return
+            if not embeddings["g1_gen_embedding"]:
+                raise ValueError("G3 critic closure produced no gen embeddings.")
+
+            first_embedding = embeddings["g1_gen_embedding"][0]
+            controller = self._get_g3_ema_controller(
+                feature_dim=int(first_embedding.shape[-1]),
+                device=first_embedding.device,
+                dtype=first_embedding.dtype,
+            )
+            result = run_g3_opd_critic_closure_from_embeddings(
+                self.args,
+                controller,
+                embeddings["g1_gen_embedding"],
+                rollout_data["response_lengths"],
+                rollout_data.get("teacher_log_probs"),
+            )
+            rollout_data["g1_token_advantages"] = result.token_advantages
+            rollout_data["rewards"] = result.scalar_rewards
+            rollout_data["g3_feature_loss"] = result.feature_step.loss.detach()
+            rollout_data["g3_raw_feature_loss"] = result.feature_step.raw_feature_loss.detach()
+        finally:
+            if not bool(getattr(self.args, "g1_use_ebft_loss", False)):
+                rollout_data.pop("g1_full_sequences", None)
+                rollout_data.pop("g1_qa_masks", None)
+
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.debug_rollout_only:
             return
@@ -672,7 +770,9 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         )
 
-        if self._is_standard_g2() and self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
+        if self._is_g3_opd_fused() and self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
+            self.compute_g3_critic_token_advantages(rollout_data)
+        elif self._is_standard_g2() and self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
             self.compute_g2_teacher_gen_embeddings(rollout_data)
             self.compute_g1_token_advantages(rollout_data)
 
@@ -726,6 +826,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 if self.args.advantage_estimator == "g1" and self.args.g1_reward_location == "trainer":
+                    if self._is_g3_opd_fused() or bool(getattr(self.args, "g3_enable", False)):
+                        raise_if_g3_detached_reward_path(self.args)
                     if not self._is_standard_g2():
                         if self.args.use_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"

@@ -13,6 +13,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.g1_ebft_data_contract import attach_ebft_g1_next_token_contract_to_batch
+from slime.utils.g3_ema import select_g1_trainer_sync_source
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
@@ -657,23 +658,14 @@ def sync_actor_critic_data(
 
     - Values are broadcast from src=1.
     - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
-    - G2 trainer-side token advantages/rewards are broadcast from the side that
-      computed them: teacher-target G2 uses critic (src=1), no-teacher/self-target
-      G2 uses actor (src=0).
+    - G1/G2/G3 trainer-side token advantages/rewards are broadcast from the side
+      that computed them. Teacher-target G2 and G3 use critic (src=1);
+      no-teacher/self-target G2 uses actor (src=0).
     Updates `rollout_data` in place with the synchronized tensors.
     """
     log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
     values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
-    is_cf_l1oo = getattr(args, "distribution_reward_type", "pointwise") == "cf_l1oo"
-    g1_sync_src = None
-    if (
-        is_cf_l1oo
-        and getattr(args, "advantage_estimator", None) == "g1"
-        and getattr(args, "g1_reward_location", None) == "trainer"
-    ):
-        # Teacher-target G2 computes trainer-side rewards on the critic side.
-        # No-teacher/self-target modes compute them on the actor/ref side.
-        g1_sync_src = 1 if getattr(args, "cf_target_mode", None) == "teacher" else 0
+    g1_sync_src = select_g1_trainer_sync_source(args)
 
     # return when not the pp last stage
     if not values and not log_probs:

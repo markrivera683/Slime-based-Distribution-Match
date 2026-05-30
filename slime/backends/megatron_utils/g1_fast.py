@@ -13,6 +13,7 @@ from slime.utils.g1_core import (
     expand_block_rewards_to_token_advantages,
 )
 from slime.utils.g2_core import compute_cf_l1oo_rewards, compute_opd_cf_l1oo_rewards
+from slime.utils.g3_ema import raise_if_g3_detached_reward_path
 
 
 def _whiten_g2_standard_student_embeddings(
@@ -454,6 +455,7 @@ def compute_g1_token_advantages_from_embeddings(
     group layout). Caller code must preserve that order through the Megatron
     embedding forward (avoid micro-batch reshuffles).
     """
+    raise_if_g3_detached_reward_path(args)
     if not gen_embeddings:
         return [], []
     if len(gen_embeddings) != len(gt_embeddings) or len(gen_embeddings) != len(response_lengths):
