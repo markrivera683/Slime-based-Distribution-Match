@@ -25,17 +25,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER_SLIME_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---------------------------------------------------------------------------
 # 0. Runtime paths
 # ---------------------------------------------------------------------------
-SLIME_ROOT="${SLIME_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SLIME_ROOT}/../.." && pwd)}"
 MEGATRON_PATH="${MEGATRON_PATH:-/root/slime_runtime/Megatron-LM}"
 SLIME_ENV_FILE="${SLIME_ENV_FILE:-/root/slime_runtime/slime_env.sh}"
 PYTHON_BIN="${PYTHON_BIN:-/root/venvs/slime/bin/python}"
 RAY_BIN="${RAY_BIN:-$(dirname "${PYTHON_BIN}")/ray}"
-BUILD_SCRIPT="${BUILD_SCRIPT:-${SLIME_ROOT}/build_conda.sh}"
+BUILD_SCRIPT="${LAUNCHER_SLIME_ROOT}/build_conda.sh"
 
 # DLC/PyTorchJob support. In DLC both pods can run this same script:
 # rank0/master starts the teacher, rank1/worker starts the student.
@@ -208,6 +209,7 @@ TEACHER_SYSTEM_PROMPT_ID="${TEACHER_SYSTEM_PROMPT_ID:-g2-opd-main-v1}"
 TEACHER_CACHE_ENABLE="${TEACHER_CACHE_ENABLE:-false}"
 TEACHER_CACHE_DIR="${TEACHER_CACHE_DIR:-/mnt/workspace/teacher_cache_shared}"
 TEACHER_MAX_RUNNING_REQUESTS="${TEACHER_MAX_RUNNING_REQUESTS:-16}"
+TEACHER_EXTRA_SGLANG_ARGS="${TEACHER_EXTRA_SGLANG_ARGS:---disable-cuda-graph --attention-backend triton --sampling-backend pytorch}"
 
 OPD_KL_COEF="${OPD_KL_COEF:-1.0}"
 OPD_TEACHER_RM_URL="${OPD_TEACHER_RM_URL:-${TEACHER_API_BASE%/}/generate}"
@@ -468,6 +470,11 @@ source_slime_env() {
     # shellcheck disable=SC1090
     source "${SLIME_ENV_FILE}"
   fi
+  if [[ "${SLIME_ROOT:-}" != "${LAUNCHER_SLIME_ROOT}" ]]; then
+    echo "[dlc] overriding SLIME_ROOT from sourced env: ${SLIME_ROOT:-<unset>} -> ${LAUNCHER_SLIME_ROOT}"
+  fi
+  export SLIME_ROOT="${LAUNCHER_SLIME_ROOT}"
+  BUILD_SCRIPT="${LAUNCHER_SLIME_ROOT}/build_conda.sh"
   if [[ -n "${VIRTUAL_ENV:-}" && -d "${VIRTUAL_ENV}/bin" ]]; then
     export PATH="${VIRTUAL_ENV}/bin:${PATH}"
   elif [[ -d "$(dirname "${PYTHON_BIN}")" ]]; then
@@ -589,7 +596,7 @@ launch_teacher_node() {
   local teacher_context_length="${TEACHER_CONTEXT_LENGTH:-4096}"
   local teacher_mem_fraction_static="${TEACHER_MEM_FRACTION_STATIC:-0.55}"
   local teacher_max_running_requests="${TEACHER_MAX_RUNNING_REQUESTS:-}"
-  local teacher_extra_sglang_args="${TEACHER_EXTRA_SGLANG_ARGS:---disable-cuda-graph}"
+  local teacher_extra_sglang_args="${TEACHER_EXTRA_SGLANG_ARGS}"
 
   if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "[ERROR] PYTHON_BIN is not executable: ${PYTHON_BIN}" >&2
@@ -636,6 +643,10 @@ PY
   echo "[2node-opd-cf-l1oo-teacher] bind=${teacher_bind_host}:${TEACHER_PORT} TP=${teacher_tp_size} DP=${teacher_dp_size} context=${teacher_context_length} mem=${teacher_mem_fraction_static}"
   printf "[2node-opd-cf-l1oo-teacher] command: " || true
   print_shell_command "${cmd[@]}"
+
+  if [[ "${PRINT_ONLY:-0}" == "1" || "${DRY_RUN_ONLY:-0}" == "1" ]]; then
+    exit 0
+  fi
 
   CUDA_VISIBLE_DEVICES="${teacher_cuda_visible_devices}" exec "${cmd[@]}"
 }

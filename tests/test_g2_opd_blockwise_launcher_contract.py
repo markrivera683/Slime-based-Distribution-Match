@@ -1,4 +1,5 @@
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -7,13 +8,14 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TWO_NODE_LAUNCHER = REPO_ROOT / "exper_scripts/main_test/run_g2_opd_cf_l1oo_qwen35_2b_2node.sh"
 LAUNCHERS = [
     pytest.param(
         REPO_ROOT / "exper_scripts/main_test/run_g2_opd_cf_l1oo_qwen35_2b_1node8.sh",
         id="1node8",
     ),
     pytest.param(
-        REPO_ROOT / "exper_scripts/main_test/run_g2_opd_cf_l1oo_qwen35_2b_2node.sh",
+        TWO_NODE_LAUNCHER,
         id="2node",
     ),
 ]
@@ -99,6 +101,7 @@ def launcher_env(tmp_path: Path) -> dict[str, str]:
         "SGLANG_ATTENTION_BACKEND",
         "SGLANG_DISABLE_OVERLAP_SCHEDULE",
         "SGLANG_GRAMMAR_BACKEND",
+        "TEACHER_EXTRA_SGLANG_ARGS",
     ):
         env.pop(key, None)
     return env
@@ -167,3 +170,62 @@ def test_g2_opd_cf_l1oo_launchers_print_blockwise_flags(script: Path, launcher_e
         assert "CUDA_VISIBLE_DEVICES=4,5,6,7" in context_lines
         assert "NUM_GPUS=4" in context_lines
         assert "RAY_NUM_GPUS=4" in context_lines
+
+
+def test_g2_2node_teacher_print_only_uses_safe_default_sglang_args(launcher_env: dict[str, str]) -> None:
+    launcher_env.update(
+        {
+            "DEPLOY_ROLE": "teacher",
+            "TEACHER_CONTEXT_LENGTH": "128",
+            "TEACHER_CUDA_VISIBLE_DEVICES": "0,1,2",
+            "TEACHER_DP_SIZE": "1",
+            "TEACHER_MEM_FRACTION_STATIC": "0.1",
+            "TEACHER_MODEL_PATH": launcher_env["MODEL_PATH"],
+            "TEACHER_TP_SIZE": "1",
+        }
+    )
+
+    output = _run_launcher(TWO_NODE_LAUNCHER, launcher_env)
+
+    assert "[2node-opd-cf-l1oo-teacher] command:" in output
+    assert "--disable-cuda-graph" in output
+    assert "--attention-backend triton" in output
+    assert "--sampling-backend pytorch" in output
+
+
+def test_g2_2node_launcher_restores_repo_root_after_sourced_env(
+    tmp_path: Path, launcher_env: dict[str, str]
+) -> None:
+    wrong_root = tmp_path / "wrong_slime_root"
+    wrong_root.mkdir()
+    wrong_build_script = wrong_root / "build_conda.sh"
+    poisoned_slime_env = tmp_path / "poisoned_slime_env.sh"
+    poisoned_slime_env.write_text(
+        "\n".join(
+            [
+                f"export SLIME_ROOT={shlex.quote(str(wrong_root))}",
+                f"export BUILD_SCRIPT={shlex.quote(str(wrong_build_script))}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    launcher_env.update(
+        {
+            "BUILD_SCRIPT": str(wrong_build_script),
+            "SLIME_ENV_FILE": str(poisoned_slime_env),
+            "SLIME_ROOT": str(wrong_root),
+        }
+    )
+
+    output = _run_launcher(TWO_NODE_LAUNCHER, launcher_env)
+
+    assert "[dlc] overriding SLIME_ROOT from sourced env:" in output
+    assert f"-> {REPO_ROOT}" in output
+    assert f"{REPO_ROOT}/train.py" in output
+    assert f"{wrong_root}/train.py" not in output
+
+    run_context = Path(launcher_env["ARTIFACT_DIR"]) / "run_context.env"
+    context_lines = set(run_context.read_text(encoding="utf-8").splitlines())
+    assert f"SLIME_ROOT={REPO_ROOT}" in context_lines
+    assert "TRAIN_ENTRYPOINT=train.py" in context_lines
