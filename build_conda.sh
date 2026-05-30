@@ -56,6 +56,7 @@ if [[ ! -d "${WHEELS_INFRA}" && -d /mnt/data/wheel_infra ]]; then
 fi
 export INSTALL_CUDA129_FROM_WHEELS_INFRA="${INSTALL_CUDA129_FROM_WHEELS_INFRA:-true}"
 export TORCH_CU129_WHEEL_DIR="${TORCH_CU129_WHEEL_DIR:-${WHEELS_INFRA}}"
+export TORCH_CU129_CONSTRAINTS="${TORCH_CU129_CONSTRAINTS:-${BASE_DIR}/torch_cu129_constraints.txt}"
 _flash_attn_cu129="${WHEELS_INFRA}/flash_attn-2.7.4+cu129torch2.9-cp312-cp312-linux_x86_64.whl"
 _flash_attn_legacy="${WHEELS_INFRA}/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl"
 if [[ -z "${FLASH_ATTN_WHEEL:-}" ]]; then
@@ -126,6 +127,19 @@ if not version.startswith("2.9.1"):
 if cuda != "12.9":
     raise SystemExit(f"[ERROR] expected torch CUDA 12.9, got {cuda}")
 PY
+}
+
+write_torch_cu129_constraints() {
+  cat > "${TORCH_CU129_CONSTRAINTS}" <<'EOF'
+torch==2.9.1+cu129
+torchvision==0.24.1+cu129
+torchaudio==2.9.1+cu129
+EOF
+  echo "[torch] wrote cu129 constraints: ${TORCH_CU129_CONSTRAINTS}"
+}
+
+pip_install_preserve_torch_stack() {
+  pip install --constraint "${TORCH_CU129_CONSTRAINTS}" "$@"
 }
 
 nvcc_release_version() {
@@ -222,6 +236,7 @@ PY
 }
 
 assert_torch_cu129
+write_torch_cu129_constraints
 maybe_install_cuda129_from_wheels_infra
 resolve_cuda_home_for_torch
 
@@ -284,7 +299,7 @@ pip install -e "${BASE_DIR}/sglang/python" --no-deps
 
 # SGLang runtime deps.
 # Keep this list explicit so dependency resolution cannot silently replace torch.
-pip install \
+pip_install_preserve_torch_stack \
   IPython \
   aiohttp \
   "apache-tvm-ffi>=0.1.5,<0.2" \
