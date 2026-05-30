@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Full standalone G2 + OPD Slime/Megatron run for Qwen3.5-2B.
+# Legacy standalone G2 + OPD Slime/Megatron run for Qwen3.5-2B.
+# This dep script preserves the older teacher-target/shadow defaults. The
+# recommended OPD-CF-L1OO mainline uses cf_target_mode=opd_onpolicy with
+# EffOPD combined_gate in the non-dep launchers.
 #
 # Deployment layouts:
 #   single_node  - teacher + student on one machine (teacher started separately)
@@ -114,6 +117,9 @@ ZERO_STAGE="${ZERO_STAGE:-3}"
 
 # ---------------------------------------------------------------------------
 # 6. G2 counterfactual teacher and OPD
+# Legacy default: teacher-target CF plus EffOPD shadow mode. For the current
+# OPD-CF-L1OO mainline, prefer CF_TARGET_MODE=opd_onpolicy and
+# EFFOPD_VALIDATION_MODE=combined_gate via the maintained non-dep launchers.
 # ---------------------------------------------------------------------------
 G2_OPD_MODE="${G2_OPD_MODE:-cf_l1oo_opd_sglang}"
 CF_TARGET_MODE="${CF_TARGET_MODE:-teacher}"

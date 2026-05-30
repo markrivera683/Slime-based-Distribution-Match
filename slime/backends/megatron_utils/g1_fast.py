@@ -12,7 +12,7 @@ from slime.utils.g1_core import (
     compute_rloo_shaped_rewards,
     expand_block_rewards_to_token_advantages,
 )
-from slime.utils.g2_core import compute_cf_l1oo_rewards, compute_opd_cf_l1oo_rewards
+from slime.utils.g2_core import compute_cf_l1oo_rewards, compute_opd_cf_l1oo_rewards, log_probs_to_group_scores
 
 
 def _whiten_g2_standard_student_embeddings(
@@ -86,30 +86,14 @@ def _teacher_log_probs_to_group_scores(
 ) -> torch.Tensor:
     if teacher_log_probs is None:
         raise ValueError("OPD-CF-L1OO requires teacher_log_probs.")
-    expected = int(num_groups) * int(n_samples_per_prompt)
-    if len(teacher_log_probs) != expected:
-        raise ValueError(
-            "OPD-CF-L1OO teacher_log_probs must align with rollout samples; "
-            f"got {len(teacher_log_probs)} for {expected} samples."
-        )
-
-    scores = []
-    for sample_idx, log_probs in enumerate(teacher_log_probs):
-        tensor = log_probs.detach().float().reshape(-1).to(device=device)
-        if tensor.numel() == 0:
-            raise ValueError(f"OPD-CF-L1OO teacher_log_probs[{sample_idx}] is empty.")
-        if normalization == "mean":
-            score = tensor.mean()
-        elif normalization == "sum":
-            score = tensor.sum()
-        else:
-            raise ValueError(
-                "Unsupported --opd-cf-score-normalization "
-                f"{normalization!r}; expected 'mean' or 'sum'."
-            )
-        scores.append(score)
-
-    return torch.stack(scores, dim=0).view(1, int(num_groups), int(n_samples_per_prompt))
+    return log_probs_to_group_scores(
+        teacher_log_probs,
+        num_groups=num_groups,
+        n_samples_per_prompt=n_samples_per_prompt,
+        device=device,
+        normalization=normalization,
+        label="OPD-CF-L1OO teacher_log_probs",
+    )
 
 
 @torch.no_grad()

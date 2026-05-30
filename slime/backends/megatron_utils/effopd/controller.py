@@ -98,6 +98,7 @@ class EffOPDController:
         best_score = base_score
         accepted_k = 0
         accepted = False
+        mode = getattr(self.args, "effopd_validation_mode", "combined_gate")
 
         num_samples = len(rollout_data.get("response_lengths") or rollout_data.get("tokens") or [])
         self.state.dv_indices = select_dv_indices(
@@ -105,6 +106,10 @@ class EffOPDController:
             dv_size=int(getattr(self.args, "effopd_dv_size", 50)),
             seed=int(getattr(self.args, "effopd_dv_seed", self.state.dv_seed)),
             existing_indices=self.state.dv_indices,
+            n_samples_per_prompt=int(getattr(self.args, "n_samples_per_prompt", 1)),
+            require_complete_prompt_groups=(
+                mode == "combined_gate" and getattr(self.args, "cf_target_mode", None) == "opd_onpolicy"
+            ),
         )
 
         base_snapshot = snapshot_named_tensors(self.source_getter())
@@ -115,7 +120,6 @@ class EffOPDController:
         else:
             previous_snapshot = self.backuper.get(EFFOPD_TAG_PREV_POWER)
 
-        mode = getattr(self.args, "effopd_validation_mode", "opd_kl_shadow_cf")
         gate_enabled = mode == "combined_gate"
         max_k = int(getattr(self.args, "effopd_max_k", 5))
         delta_norm_sq = 0.0
@@ -183,11 +187,10 @@ class EffOPDController:
             force_weight_sync = bool(getattr(self.args, "effopd_force_weight_sync", True))
 
         if accepted:
-            self._decay_learning_rate()
             self.state.num_accepts += 1
             self.state.accepted_k = accepted_k
-            self.state.lr_scale *= float(getattr(self.args, "effopd_lr_decay", 0.5))
             self.backuper.backup("actor")
+            logger.info("EffOPD accepted extrapolation; preserved optimizer and scheduler state.")
         else:
             restore_named_tensors(self.source_getter(), base_snapshot)
             self.backuper.backup("actor")
@@ -277,16 +280,3 @@ class EffOPDController:
             raise RuntimeError("EffOPD combined_gate could not find a decision rank.")
         dist.broadcast(tensor, src=src_rank, group=get_gloo_group())
         return bool(int(tensor.item()))
-
-    def _decay_learning_rate(self) -> None:
-        decay = float(getattr(self.args, "effopd_lr_decay", 0.5))
-        if decay <= 0:
-            return
-        optimizers = [self.optimizer]
-        inner = getattr(self.optimizer, "optimizer", None)
-        if inner is not None and inner is not self.optimizer:
-            optimizers.append(inner)
-        for optimizer in optimizers:
-            for group in getattr(optimizer, "param_groups", []) or []:
-                group["lr"] = float(group.get("lr", getattr(self.args, "lr", 0.0))) * decay
-        logger.info("EffOPD accepted extrapolation; decayed actor lr by factor %.6g", decay)

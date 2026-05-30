@@ -9,9 +9,11 @@
 #   rank 1 -> Slime student G2 cf_l1oo + SGLang OPD + EffOPD smoke on 8 GPUs
 #
 # Defaults are intentionally conservative:
-#   - EffOPD is enabled in shadow mode by default.
+#   - EffOPD is enabled in shadow/proxy smoke mode (`opd_kl_shadow_cf`) by default.
 #   - NUM_ROLLOUT=4 triggers steps 1/2/4.
 #   - SAVE_INTERVAL=1 persists sidecar state every rollout.
+#   - The main launchers keep their real `combined_gate` defaults; this wrapper
+#     opts into mechanism-only smoke unless EFFOPD_VALIDATION_MODE is overridden.
 #
 # To exercise real D_v-gated extrapolation after shadow smoke passes:
 #   EFFOPD_VALIDATION_MODE=combined_gate EFFOPD_MAX_TRIGGERS=1 NUM_ROLLOUT=2 bash ...

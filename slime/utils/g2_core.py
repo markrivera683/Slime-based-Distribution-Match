@@ -3,6 +3,56 @@ from __future__ import annotations
 import torch
 
 
+def log_probs_to_sequence_scores(
+    log_probs: list[torch.Tensor],
+    *,
+    device: torch.device,
+    normalization: str,
+    label: str = "log_probs",
+) -> torch.Tensor:
+    """Aggregate per-token logprobs into one score per sample."""
+
+    scores = []
+    for sample_idx, sample_log_probs in enumerate(log_probs):
+        tensor = sample_log_probs.detach().float().reshape(-1).to(device=device)
+        if tensor.numel() == 0:
+            raise ValueError(f"{label}[{sample_idx}] is empty.")
+        if normalization == "mean":
+            score = tensor.mean()
+        elif normalization == "sum":
+            score = tensor.sum()
+        else:
+            raise ValueError(
+                "Unsupported --opd-cf-score-normalization "
+                f"{normalization!r}; expected 'mean' or 'sum'."
+            )
+        scores.append(score)
+
+    return torch.stack(scores, dim=0)
+
+
+def log_probs_to_group_scores(
+    log_probs: list[torch.Tensor],
+    *,
+    num_groups: int,
+    n_samples_per_prompt: int,
+    device: torch.device,
+    normalization: str,
+    label: str = "log_probs",
+) -> torch.Tensor:
+    expected = int(num_groups) * int(n_samples_per_prompt)
+    if len(log_probs) != expected:
+        raise ValueError(
+            f"{label} must align with grouped rollout samples; got {len(log_probs)} for {expected} samples."
+        )
+    return log_probs_to_sequence_scores(
+        log_probs,
+        device=device,
+        normalization=normalization,
+        label=label,
+    ).view(1, int(num_groups), int(n_samples_per_prompt))
+
+
 def _get_fixed_cf_frequencies(
     *,
     input_dim: int,

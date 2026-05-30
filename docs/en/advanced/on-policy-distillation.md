@@ -101,6 +101,14 @@ bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
 bash examples/on_policy_distillation/run-qwen3-8B-opd-megatron.sh
 ```
 
+## EffOPD for OPD-CF-L1OO
+
+EffOPD is a checkpoint-level acceleration mechanism for the OPD-CF-L1OO workflow. It is not a new loss, does not replace OPD or CF-L1OO, and does not introduce trainable parameters. The mainline configuration uses `cf_target_mode=opd_onpolicy`, `--use-effopd`, and `--effopd-validation-mode combined_gate`.
+
+When the combined gate accepts an extrapolated checkpoint, only the model weights advance; optimizer and scheduler state are preserved. The gate does not run strict/full counterfactual recomputation for each candidate. Instead, it scores candidates on a fixed-support, policy-weighted CF proxy from on-policy samples and subtracts the OPD reverse-KL term. `--effopd-dv-size` is a maximum final D_v sample budget after prompt-group alignment, so OPD-CF-L1OO validation keeps complete prompt groups without exceeding that budget.
+
+EffOPD live validation still requires GPU/Ray integration testing. Unit tests cover the mechanism contracts, but they do not prove end-to-end throughput, synchronization, or candidate acceptance behavior under a real distributed training run.
+
 ## Preliminary Results
 
 Using Qwen3-8B-Base model SFT-ed on part of the [OpenThoughts3-1.2M](https://huggingface.co/datasets/open-thoughts/OpenThoughts3-1.2M) dataset, on-policy distillation with a Qwen3-32B teacher on the remaining data yields:

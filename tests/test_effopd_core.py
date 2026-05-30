@@ -6,7 +6,12 @@ import torch
 from slime.backends.megatron_utils.effopd.controller import EffOPDController
 from slime.backends.megatron_utils.effopd.delta import apply_extrapolation_from_snapshots, restore_named_tensors
 from slime.backends.megatron_utils.effopd.state import EffOPDState, load_effopd_state, save_effopd_state
-from slime.backends.megatron_utils.effopd.validate import score_from_rollout_data, select_dv_indices
+from slime.backends.megatron_utils.effopd.validate import (
+    align_dv_indices_to_prompt_groups,
+    score_from_terms,
+    score_from_rollout_data,
+    select_dv_indices,
+)
 
 
 def test_effopd_power_of_two_trigger():
@@ -50,6 +55,77 @@ def test_effopd_combined_proxy_keeps_g2_and_opd_terms_separate():
     assert score.score == score.combined_proxy
 
 
+def test_effopd_combined_gate_weights_cf_rewards_by_candidate_policy():
+    args = SimpleNamespace(
+        opd_kl_coef=0.0,
+        effopd_validation_mode="combined_gate",
+        n_samples_per_prompt=2,
+        opd_cf_score_normalization="sum",
+    )
+    cf_rewards = [0.0, 10.0]
+    teacher_log_probs = [torch.tensor([0.0]), torch.tensor([0.0])]
+
+    left_heavy = score_from_terms(
+        args,
+        cf_rewards=cf_rewards,
+        teacher_log_probs=teacher_log_probs,
+        student_log_probs=[torch.tensor([0.0]), torch.tensor([-2.0])],
+        mode="combined_gate",
+    )
+    right_heavy = score_from_terms(
+        args,
+        cf_rewards=cf_rewards,
+        teacher_log_probs=teacher_log_probs,
+        student_log_probs=[torch.tensor([-2.0]), torch.tensor([0.0])],
+        mode="combined_gate",
+    )
+
+    assert left_heavy.opd_reverse_kl_mean == right_heavy.opd_reverse_kl_mean
+    assert left_heavy.cf_l1oo_reward_mean < 5.0
+    assert right_heavy.cf_l1oo_reward_mean > 5.0
+    assert left_heavy.combined_proxy != right_heavy.combined_proxy
+
+
+def test_effopd_combined_gate_opd_onpolicy_raises_on_malformed_weighted_proxy():
+    args = SimpleNamespace(
+        cf_target_mode="opd_onpolicy",
+        effopd_validation_mode="combined_gate",
+        n_samples_per_prompt=2,
+        opd_cf_score_normalization="sum",
+        opd_kl_coef=0.0,
+    )
+
+    with pytest.raises(ValueError, match="complete prompt groups"):
+        score_from_terms(
+            args,
+            cf_rewards=[1.0, 2.0, 3.0],
+            teacher_log_probs=[torch.tensor([0.0]), torch.tensor([0.0]), torch.tensor([0.0])],
+            student_log_probs=[torch.tensor([0.0]), torch.tensor([0.0]), torch.tensor([0.0])],
+            mode="combined_gate",
+            strict_weighted_cf_proxy=True,
+        )
+
+
+def test_effopd_combined_gate_non_strict_keeps_plain_cf_fallback():
+    args = SimpleNamespace(
+        effopd_validation_mode="combined_gate",
+        n_samples_per_prompt=2,
+        opd_cf_score_normalization="sum",
+        opd_kl_coef=0.0,
+    )
+
+    score = score_from_terms(
+        args,
+        cf_rewards=[1.0, 3.0],
+        teacher_log_probs=None,
+        student_log_probs=[torch.tensor([0.0]), torch.tensor([0.0]), torch.tensor([0.0])],
+        mode="combined_gate",
+    )
+
+    assert score.cf_l1oo_reward_mean == 2.0
+    assert score.combined_proxy == 2.0
+
+
 def test_effopd_selects_stable_dv_indices():
     first = select_dv_indices(num_samples=10, dv_size=4, seed=7)
     second = select_dv_indices(num_samples=10, dv_size=4, seed=7)
@@ -57,6 +133,50 @@ def test_effopd_selects_stable_dv_indices():
     assert len(first) == 4
     assert first == sorted(first)
     assert select_dv_indices(num_samples=3, dv_size=50, seed=7) == [0, 1, 2]
+
+
+def test_effopd_aligns_dv_indices_to_complete_prompt_groups():
+    aligned = align_dv_indices_to_prompt_groups(indices=[1, 6], num_samples=8, n_samples_per_prompt=4)
+
+    assert aligned == list(range(8))
+    for offset in range(0, len(aligned), 4):
+        group = aligned[offset : offset + 4]
+        assert group == list(range(group[0], group[0] + 4))
+
+
+def test_effopd_selects_opd_onpolicy_dv_groups_without_exceeding_budget():
+    selected = select_dv_indices(
+        num_samples=12,
+        dv_size=5,
+        seed=7,
+        n_samples_per_prompt=4,
+        require_complete_prompt_groups=True,
+    )
+
+    assert len(selected) == 4
+    assert len(selected) <= 5
+    assert selected == list(range(selected[0], selected[0] + 4))
+
+    expanded = select_dv_indices(
+        num_samples=12,
+        dv_size=4,
+        seed=7,
+        existing_indices=[1],
+        n_samples_per_prompt=4,
+        require_complete_prompt_groups=True,
+    )
+    assert expanded == [0, 1, 2, 3]
+
+
+def test_effopd_rejects_opd_onpolicy_dv_budget_smaller_than_group():
+    with pytest.raises(ValueError, match="at least n_samples_per_prompt"):
+        select_dv_indices(
+            num_samples=8,
+            dv_size=3,
+            seed=7,
+            n_samples_per_prompt=4,
+            require_complete_prompt_groups=True,
+        )
 
 
 def test_effopd_state_persists_dv_indices(tmp_path):
@@ -131,6 +251,9 @@ def test_effopd_combined_gate_accepts_largest_passing_candidate(tmp_path):
     param = torch.tensor([1.0])
     source_getter = lambda: [("w", param)]
     backuper = _DummyBackuper(source_getter)
+    inner_optimizer = SimpleNamespace(param_groups=[{"lr": 0.25}])
+    optimizer = SimpleNamespace(param_groups=[{"lr": 0.5}], optimizer=inner_optimizer)
+    opt_param_scheduler = SimpleNamespace(num_steps=7, lr=0.5)
 
     def evaluator(_rollout_data, dv_indices):
         value = float(param.item())
@@ -146,8 +269,8 @@ def test_effopd_combined_gate_accepts_largest_passing_candidate(tmp_path):
         args=_effopd_args(tmp_path),
         source_getter=source_getter,
         backuper=backuper,
-        optimizer=SimpleNamespace(param_groups=[]),
-        opt_param_scheduler=None,
+        optimizer=optimizer,
+        opt_param_scheduler=opt_param_scheduler,
         validation_evaluator=evaluator,
     )
     controller.initialise()
@@ -161,3 +284,9 @@ def test_effopd_combined_gate_accepts_largest_passing_candidate(tmp_path):
     assert result.accepted
     assert result.accepted_k == 1
     assert torch.allclose(param, torch.tensor([4.0]))
+    assert optimizer.param_groups[0]["lr"] == 0.5
+    assert inner_optimizer.param_groups[0]["lr"] == 0.25
+    assert opt_param_scheduler.num_steps == 7
+    assert opt_param_scheduler.lr == 0.5
+    assert controller.state.lr_scale == 1.0
+    assert result.lr_scale == 1.0

@@ -167,3 +167,33 @@ def test_g2_opd_cf_l1oo_launchers_print_blockwise_flags(script: Path, launcher_e
         assert "CUDA_VISIBLE_DEVICES=4,5,6,7" in context_lines
         assert "NUM_GPUS=4" in context_lines
         assert "RAY_NUM_GPUS=4" in context_lines
+
+
+@pytest.mark.parametrize("script", LAUNCHERS)
+def test_g2_opd_cf_l1oo_launchers_print_effopd_combined_gate_flags(
+    script: Path, launcher_env: dict[str, str]
+) -> None:
+    env = launcher_env.copy()
+    env["ENABLE_EFFOPD"] = "true"
+    if script.name.endswith("_1node8.sh"):
+        for key in (
+            "ACTOR_NUM_GPUS_PER_NODE",
+            "COLOCATE",
+            "CRITIC_NUM_GPUS_PER_NODE",
+            "ROLLOUT_NUM_GPUS",
+            "ROLLOUT_NUM_GPUS_PER_ENGINE",
+            "TENSOR_MODEL_PARALLEL_SIZE",
+        ):
+            env.pop(key, None)
+
+    output = _run_launcher(script, env)
+
+    assert "--use-effopd" in output
+    assert "--effopd-validation-mode combined_gate" in output
+    assert "--cf-target-mode opd_onpolicy" in output
+    if script.name.endswith("_1node8.sh"):
+        assert "--colocate" not in output
+        assert "--rollout-num-gpus 2" in output
+        assert "COLOCATE=false" in output
+        assert "[layout] student resources: actor=1, critic=1, rollout=2, rollout_gpu_per_engine=1, visible=4" in output
+        assert "rollout=colocated" not in output

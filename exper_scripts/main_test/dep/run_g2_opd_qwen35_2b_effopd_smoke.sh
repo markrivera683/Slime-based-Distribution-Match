@@ -2,9 +2,10 @@
 # Mechanism-validation smoke for G2 cf_l1oo + SGLang OPD + EffOPD.
 #
 # G2 here means cf_l1oo reward/distribution matching. OPD is the SGLang
-# teacher-logprob distillation signal. EffOPD is enabled in shadow mode by
-# default so the run validates trigger/state/logging without changing the
-# production G2+OPD objective.
+# teacher-logprob distillation signal. This wrapper intentionally defaults to
+# the shadow/proxy EffOPD smoke path (`opd_kl_shadow_cf`) so it validates
+# trigger/state/logging without changing the production G2+OPD objective. The
+# main launcher defaults remain for real `combined_gate` validation.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -69,6 +69,11 @@ def _base_slime_args(**overrides):
         eval_max_context_len=None,
         eval_prompt_data=None,
         eval_reward_key=None,
+        enable_weights_backuper=True,
+        effopd_dv_size=50,
+        effopd_lr_decay=0.5,
+        effopd_max_k=5,
+        effopd_validation_mode="combined_gate",
         freeze_params_name_list=None,
         g1_context_length=8,
         g1_ebft_logprob_indexing="strict_block_source",
@@ -138,6 +143,26 @@ def _base_slime_args(**overrides):
     return Namespace(**values)
 
 
+def _g2_opd_cf_l1oo_args(**overrides):
+    values = dict(
+        advantage_estimator="g1",
+        cf_target_mode="opd_onpolicy",
+        critic_lr=0.0,
+        critic_lr_head=0.0,
+        distribution_reward_type="cf_l1oo",
+        g1_embedding_source="megatron_ref",
+        g1_reward_location="trainer",
+        n_samples_per_prompt=2,
+        opd_type="sglang",
+        use_effopd=True,
+        use_opd=True,
+        use_whitening=True,
+        zero_stage=3,
+    )
+    values.update(overrides)
+    return _base_slime_args(**values)
+
+
 def test_g1_ebft_logprob_indexing_parser_default_and_choices(monkeypatch):
     arguments = _arguments_module(monkeypatch)
     parser = argparse.ArgumentParser()
@@ -153,6 +178,31 @@ def test_g1_ebft_logprob_indexing_parser_default_and_choices(monkeypatch):
 
     with pytest.raises(SystemExit):
         parser.parse_args([*required_args, "--g1-ebft-logprob-indexing", "bad_indexing"])
+
+
+def test_effopd_validation_mode_parser_default_and_shadow_choices(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    arguments.get_slime_extra_args_provider()(parser)
+
+    required_args = ["--rollout-batch-size", "1"]
+
+    assert parser.parse_args(required_args).effopd_validation_mode == "combined_gate"
+    assert (
+        parser.parse_args(
+            [*required_args, "--effopd-validation-mode", "opd_kl_shadow_cf"]
+        ).effopd_validation_mode
+        == "opd_kl_shadow_cf"
+    )
+    assert (
+        parser.parse_args(
+            [*required_args, "--effopd-validation-mode", "combined_shadow"]
+        ).effopd_validation_mode
+        == "combined_shadow"
+    )
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([*required_args, "--effopd-validation-mode", "bad_mode"])
 
 
 def test_g1_ebft_rollout_mask_mode_parser_default_and_choices(monkeypatch):
@@ -360,4 +410,110 @@ def test_slime_validate_args_rejects_rollout_mask_mode_without_ebft_loss(monkeyp
     args = _base_slime_args(g1_use_ebft_loss=False, g1_ebft_rollout_mask_mode="sparse_ir")
 
     with pytest.raises(ValueError, match="requires --g1-use-ebft-loss"):
+        arguments.slime_validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("cf_target_mode", "overrides"),
+    [
+        ("opd_onpolicy", {}),
+        (
+            "teacher",
+            {
+                "cf_teacher_lambda": 0.6,
+                "cf_teacher_n_samples": 4,
+                "teacher_api_base": "http://127.0.0.1:30000/v1",
+                "teacher_backend": "remote",
+                "teacher_model_name": "teacher",
+            },
+        ),
+    ],
+)
+def test_slime_validate_args_accepts_effopd_supported_cf_target_modes(monkeypatch, cf_target_mode, overrides):
+    arguments = _arguments_module(monkeypatch)
+    args = _g2_opd_cf_l1oo_args(cf_target_mode=cf_target_mode, **overrides)
+
+    arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_accepts_effopd_lr_decay_zero(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _g2_opd_cf_l1oo_args(effopd_lr_decay=0.0)
+
+    arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_opd_onpolicy_without_sglang_opd(monkeypatch, tmp_path):
+    arguments = _arguments_module(monkeypatch)
+    opd_teacher_load = tmp_path / "opd_teacher"
+    opd_teacher_load.mkdir()
+    (opd_teacher_load / "latest_checkpointed_iteration.txt").write_text("1\n", encoding="utf-8")
+    args = _g2_opd_cf_l1oo_args(use_effopd=False, opd_type="megatron", opd_teacher_load=str(opd_teacher_load))
+
+    with pytest.raises(ValueError, match="OPD-CF-L1OO requires --opd-type sglang"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_effopd_without_sglang_opd(monkeypatch, tmp_path):
+    arguments = _arguments_module(monkeypatch)
+    opd_teacher_load = tmp_path / "opd_teacher"
+    opd_teacher_load.mkdir()
+    (opd_teacher_load / "latest_checkpointed_iteration.txt").write_text("1\n", encoding="utf-8")
+    args = _g2_opd_cf_l1oo_args(opd_type="megatron", opd_teacher_load=str(opd_teacher_load))
+
+    with pytest.raises(ValueError, match="EffOPD currently targets SGLang OPD"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_effopd_without_cf_l1oo(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _base_slime_args(
+        cf_target_mode="teacher",
+        distribution_reward_type="pointwise",
+        opd_type="sglang",
+        use_effopd=True,
+        use_opd=True,
+    )
+
+    with pytest.raises(ValueError, match="EffOPD currently targets G2 cf_l1oo reward"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_effopd_colocate(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _g2_opd_cf_l1oo_args(colocate=True)
+
+    with pytest.raises(ValueError, match="non-colocate"):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_effopd_without_weights_backuper(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _g2_opd_cf_l1oo_args(enable_weights_backuper=False)
+
+    with pytest.raises(ValueError, match="weights backuper"):
+        arguments.slime_validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"effopd_dv_size": 0}, "--effopd-dv-size must be positive"),
+        ({"effopd_lr_decay": -0.1}, "--effopd-lr-decay must be non-negative"),
+        ({"effopd_max_k": 0}, "--effopd-max-k must be >= 1"),
+    ],
+)
+def test_slime_validate_args_rejects_invalid_effopd_numeric_settings(monkeypatch, override, match):
+    arguments = _arguments_module(monkeypatch)
+    args = _g2_opd_cf_l1oo_args(**override)
+
+    with pytest.raises(ValueError, match=match):
+        arguments.slime_validate_args(args)
+
+
+def test_slime_validate_args_rejects_effopd_opd_onpolicy_dv_budget_smaller_than_group(monkeypatch):
+    arguments = _arguments_module(monkeypatch)
+    args = _g2_opd_cf_l1oo_args(effopd_dv_size=3, n_samples_per_prompt=4)
+
+    with pytest.raises(ValueError, match="--effopd-dv-size must be >= --n-samples-per-prompt"):
         arguments.slime_validate_args(args)

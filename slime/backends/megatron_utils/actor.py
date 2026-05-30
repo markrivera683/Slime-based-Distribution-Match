@@ -33,7 +33,7 @@ from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .effopd import EffOPDController, EffOPDResult
-from .effopd.validate import score_from_terms, slice_rollout_data_for_indices
+from .effopd.validate import align_dv_indices_to_prompt_groups, score_from_terms, slice_rollout_data_for_indices
 from .g1_fast import compute_g1_token_advantages_from_embeddings
 from .initialize import init, is_megatron_main_rank
 from .loss import (
@@ -438,7 +438,19 @@ class MegatronTrainRayActor(TrainRayActor):
         if "rewards" not in rollout_data:
             raise ValueError("EffOPD combined_gate requires G2 cf_l1oo rewards in rollout_data.")
 
-        dv_rollout_data = slice_rollout_data_for_indices(rollout_data, dv_indices)
+        evaluator_indices = dv_indices
+        if getattr(self.args, "cf_target_mode", None) == "opd_onpolicy":
+            num_samples = len(rollout_data.get("response_lengths") or rollout_data.get("tokens") or [])
+            evaluator_indices = align_dv_indices_to_prompt_groups(
+                indices=dv_indices,
+                num_samples=num_samples,
+                n_samples_per_prompt=int(getattr(self.args, "n_samples_per_prompt", 1)),
+                max_size=int(getattr(self.args, "effopd_dv_size", num_samples)),
+            )
+            if not evaluator_indices:
+                raise ValueError("EffOPD combined_gate requires D_v to include at least one complete prompt group.")
+
+        dv_rollout_data = slice_rollout_data_for_indices(rollout_data, evaluator_indices)
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, dv_rollout_data)
         candidate_outputs = self.compute_log_prob(
             data_iterator,
@@ -462,6 +474,7 @@ class MegatronTrainRayActor(TrainRayActor):
             teacher_log_probs=dv_rollout_data.get("teacher_log_probs"),
             student_log_probs=candidate_log_probs,
             mode="combined_gate",
+            strict_weighted_cf_proxy=getattr(self.args, "cf_target_mode", None) == "opd_onpolicy",
         )
 
     def compute_g1_token_advantages(
